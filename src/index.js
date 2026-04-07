@@ -8,7 +8,7 @@ const CONDITION = 'Used';
 const MIN_PRICE = 25; // Floor price to exclude accessories
 const MIN_Z_SCORE = -1.0; // Show listings at or below 1 std dev under median
 const EBAY_FEE_RATE = 0.13; // ~13% eBay seller fees
-const RESULTS_PER_PAGE = 100;
+const RESULTS_PER_PAGE = 200;
 const MAX_ENRICH = 50; // How many top deals to enrich with getItem() details
 const MAX_LLM_EVAL = 50; // How many deals to evaluate with LLM
 const MAX_IMAGES_PER_LISTING = 5; // Max images to send to LLM per listing
@@ -142,10 +142,11 @@ async function getMarketListings(query, condition) {
   const conditionFilter = normalizeBrowseCondition(condition);
   const priceFilter = MIN_PRICE > 0 ? `,price:[${MIN_PRICE}..],priceCurrency:USD` : ',priceCurrency:USD';
   const allItems = [];
-  const maxPages = 2;
   const pageSize = RESULTS_PER_PAGE;
+  const maxItems = 10_000; // eBay Browse API pagination cap
+  let page = 0;
 
-  for (let page = 0; page < maxPages; page++) {
+  while (allItems.length < maxItems) {
     try {
       const result = await callApiWithRetry(
         `Browse market listings page ${page + 1}`,
@@ -164,7 +165,9 @@ async function getMarketListings(query, condition) {
       allItems.push(...items);
 
       const total = result?.total || 0;
-      if ((page + 1) * pageSize >= total) break;
+      if (allItems.length >= total) break;
+
+      page++;
     } catch (err) {
       if (allItems.length === 0) {
         throw new Error(
