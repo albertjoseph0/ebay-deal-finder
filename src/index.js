@@ -646,27 +646,35 @@ async function findDeals(query, condition, marketStats) {
     let page = 0;
 
     while (allDealItems.length < maxItems) {
-      const results = await callApiWithRetry(
-        `Browse deal search page ${page + 1}`,
-        () =>
-          eBay.buy.browse.search({
-            q: fullQuery,
-            filter: `buyingOptions:{FIXED_PRICE},conditions:{${conditionFilter}},${priceFilter},priceCurrency:USD`,
-            sort: 'price',
-            limit: String(RESULTS_PER_PAGE),
-            offset: String(page * RESULTS_PER_PAGE),
-          })
-      );
+      try {
+        const results = await callApiWithRetry(
+          `Browse deal search page ${page + 1}`,
+          () =>
+            eBay.buy.browse.search({
+              q: fullQuery,
+              filter: `buyingOptions:{FIXED_PRICE},conditions:{${conditionFilter}},${priceFilter},priceCurrency:USD`,
+              sort: 'price',
+              limit: String(RESULTS_PER_PAGE),
+              offset: String(page * RESULTS_PER_PAGE),
+            })
+        );
 
-      const items = results?.itemSummaries;
-      if (!items || items.length === 0) break;
+        const items = results?.itemSummaries;
+        if (!items || items.length === 0) break;
 
-      allDealItems.push(...items);
+        allDealItems.push(...items);
 
-      const total = results?.total || 0;
-      if (allDealItems.length >= total) break;
+        const total = results?.total || 0;
+        if (allDealItems.length >= total) break;
 
-      page++;
+        page++;
+      } catch (err) {
+        if (allDealItems.length === 0) throw err;
+        console.warn(
+          `⚠ Deal search stopped at page ${page + 1}: ${errorMessage(err)}. Continuing with ${allDealItems.length} result(s).`
+        );
+        break;
+      }
     }
 
     const items = allDealItems;
