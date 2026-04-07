@@ -9,8 +9,6 @@ const MIN_PRICE = 25; // Floor price to exclude accessories
 const MIN_Z_SCORE = -1.0; // Show listings at or below 1 std dev under median
 const EBAY_FEE_RATE = 0.13; // ~13% eBay seller fees
 const RESULTS_PER_PAGE = 200;
-const MAX_ENRICH = 50; // How many top deals to enrich with getItem() details
-const MAX_LLM_EVAL = 50; // How many deals to evaluate with LLM
 const MAX_IMAGES_PER_LISTING = 5; // Max images to send to LLM per listing
 const MIN_MARKET_SAMPLE = 20;
 const MIN_STD_DEV = 0.01;
@@ -305,14 +303,12 @@ function analyzePrices(marketItems) {
 
 // ─── Step 3a: Enrich deals with sold quantity ───────────────────
 async function enrichDealsWithDetails(deals) {
-  const topDeals = deals.slice(0, MAX_ENRICH);
-
   console.log(
-    `\n📦 Enriching top ${topDeals.length} deals with sold quantity data...\n`
+    `\n📦 Enriching ${deals.length} deals with sold quantity data...\n`
   );
 
   const soldByItemId = new Map();
-  for (const deal of topDeals) {
+  for (const deal of deals) {
     try {
       const details = await callApiWithRetry(
         `Browse sold quantity for ${deal.itemId}`,
@@ -557,9 +553,9 @@ async function evaluateDealsWithLLM(deals, marketStats) {
     return deals;
   }
 
-  const toEvaluate = deals.slice(0, MAX_LLM_EVAL);
+  const toEvaluate = deals;
   console.log(
-    `\n🤖 Evaluating top ${toEvaluate.length} deals with Azure OpenAI (${LLM_CONCURRENCY} parallel)...\n`
+    `\n🤖 Evaluating ${toEvaluate.length} deals with Azure OpenAI (${LLM_CONCURRENCY} parallel)...\n`
   );
 
   let completed = 0;
@@ -636,17 +632,36 @@ async function findDeals(query, condition, marketStats) {
     const fullQuery = SEARCH_EXCLUSIONS ? `${query} ${SEARCH_EXCLUSIONS}` : query;
     const priceFloor = MIN_PRICE > 0 ? MIN_PRICE : '';
     const priceFilter = priceFloor ? `price:[${priceFloor}..${maxPrice}]` : `price:[..${maxPrice}]`;
-    const results = await callApiWithRetry(`Browse search for "${query}"`, () =>
-      eBay.buy.browse.search({
-        q: fullQuery,
-        filter: `buyingOptions:{FIXED_PRICE},conditions:{${conditionFilter}},${priceFilter},priceCurrency:USD`,
-        sort: 'price',
-        limit: '50',
-      })
-    );
+    const allDealItems = [];
+    const maxItems = 10_000;
+    let page = 0;
 
-    const items = results?.itemSummaries;
-    if (!items || items.length === 0) {
+    while (allDealItems.length < maxItems) {
+      const results = await callApiWithRetry(
+        `Browse deal search page ${page + 1}`,
+        () =>
+          eBay.buy.browse.search({
+            q: fullQuery,
+            filter: `buyingOptions:{FIXED_PRICE},conditions:{${conditionFilter}},${priceFilter},priceCurrency:USD`,
+            sort: 'price',
+            limit: String(RESULTS_PER_PAGE),
+            offset: String(page * RESULTS_PER_PAGE),
+          })
+      );
+
+      const items = results?.itemSummaries;
+      if (!items || items.length === 0) break;
+
+      allDealItems.push(...items);
+
+      const total = results?.total || 0;
+      if (allDealItems.length >= total) break;
+
+      page++;
+    }
+
+    const items = allDealItems;
+    if (items.length === 0) {
       console.log('😕 No deals found right now. Try again later!\n');
       return [];
     }
