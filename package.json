@@ -5,10 +5,15 @@
   "type": "module",
   "scripts": {
     "start": "node --env-file=.env src/index.js",
-    "search": "node --env-file=.env src/index.js"
+    "search": "node --env-file=.env src/index.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
   },
   "dependencies": {
     "ebay-api": "^9.1.1",
     "openai": "^6.33.0"
+  },
+  "devDependencies": {
+    "eslint": "^10.2.0"
   }
 }

@@ -10,6 +10,13 @@ const RESULTS_PER_PAGE = 100;
 const MAX_ENRICH = 20; // How many top deals to enrich with getItem() details
 const MAX_LLM_EVAL = 10; // How many deals to evaluate with LLM
 const MAX_IMAGES_PER_LISTING = 5; // Max images to send to LLM per listing
+const MIN_SOLD_SAMPLE = 20;
+const MIN_STD_DEV = 0.01;
+const FALLBACK_DISCOUNT_RATE = 0.1; // Used when market variance is too low for z-score
+const API_TIMEOUT_MS = 15_000;
+const LLM_TIMEOUT_MS = 45_000;
+const API_MAX_RETRIES = 2;
+const API_RETRY_BASE_DELAY_MS = 500;
 
 // ─── Initialize eBay client from .env ───────────────────────────
 const eBay = eBayApi.fromEnv();
@@ -54,6 +61,77 @@ function stdDev(numbers, mean) {
   return Math.sqrt(squaredDiffs.reduce((a, b) => a + b, 0) / numbers.length);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorMessage(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function withTimeout(promiseFactory, timeoutMs, label) {
+  let timeoutHandle;
+  const operationPromise = Promise.resolve().then(() => promiseFactory());
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([operationPromise, timeoutPromise]).finally(() => {
+    clearTimeout(timeoutHandle);
+  });
+}
+
+function isRetryableApiError(err) {
+  const status =
+    err?.meta?.res?.status ??
+    err?.response?.status ??
+    err?.statusCode ??
+    err?.status;
+  if (typeof status === 'number') {
+    return status === 408 || status === 429 || status >= 500;
+  }
+
+  const msg = errorMessage(err).toLowerCase();
+  return (
+    msg.includes('timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('network') ||
+    msg.includes('econnreset') ||
+    msg.includes('socket hang up')
+  );
+}
+
+async function callApiWithRetry(
+  label,
+  promiseFactory,
+  { timeoutMs = API_TIMEOUT_MS, maxRetries = API_MAX_RETRIES } = {}
+) {
+  let attempt = 0;
+
+  while (true) {
+    attempt++;
+    try {
+      return await withTimeout(promiseFactory, timeoutMs, label);
+    } catch (err) {
+      const shouldRetry = attempt <= maxRetries && isRetryableApiError(err);
+      if (!shouldRetry) throw err;
+
+      const waitMs = API_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      console.warn(
+        `⚠ ${label} failed (attempt ${attempt}/${maxRetries + 1}): ${errorMessage(err)}. Retrying in ${waitMs}ms...`
+      );
+      await sleep(waitMs);
+    }
+  }
+}
+
+function normalizeBrowseCondition(condition) {
+  return condition.trim().toUpperCase().replace(/\s+/g, '_');
+}
+
 // ─── Step 1: Get sold prices (market value) ─────────────────────
 async function getSoldPrices(query, condition) {
   console.log(`\n📊 Fetching sold listings for "${query}" (${condition})...\n`);
@@ -64,18 +142,22 @@ async function getSoldPrices(query, condition) {
 
   while (page <= maxPages) {
     try {
-      const result = await eBay.finding.findItemsAdvanced({
-        keywords: query,
-        itemFilter: [
-          { name: 'SoldItemsOnly', value: 'true' },
-          { name: 'Condition', value: condition },
-        ],
-        sortOrder: 'EndTimeSoonest',
-        paginationInput: {
-          entriesPerPage: RESULTS_PER_PAGE,
-          pageNumber: page,
-        },
-      });
+      const result = await callApiWithRetry(
+        `Finding sold listings page ${page}`,
+        () =>
+          eBay.finding.findItemsAdvanced({
+            keywords: query,
+            itemFilter: [
+              { name: 'SoldItemsOnly', value: 'true' },
+              { name: 'Condition', value: condition },
+            ],
+            sortOrder: 'EndTimeSoonest',
+            paginationInput: {
+              entriesPerPage: RESULTS_PER_PAGE,
+              pageNumber: page,
+            },
+          })
+      );
 
       const items = result?.searchResult?.item;
       if (!items || items.length === 0) break;
@@ -89,7 +171,14 @@ async function getSoldPrices(query, condition) {
       if (page >= totalPages) break;
       page++;
     } catch (err) {
-      console.error(`Error fetching page ${page}:`, err.message);
+      if (allItems.length === 0) {
+        throw new Error(
+          `Unable to fetch sold listings page ${page}: ${errorMessage(err)}`
+        );
+      }
+      console.warn(
+        `⚠ Sold listings fetch stopped at page ${page}: ${errorMessage(err)}. Continuing with ${allItems.length} result(s).`
+      );
       break;
     }
   }
@@ -112,6 +201,12 @@ function analyzePrices(soldItems) {
     console.log('❌ No sold price data found.');
     return null;
   }
+  if (prices.length < MIN_SOLD_SAMPLE) {
+    console.log(
+      `❌ Not enough sold listings for reliable pricing (${prices.length} found, need at least ${MIN_SOLD_SAMPLE}).`
+    );
+    return null;
+  }
 
   const sorted = [...prices].sort((a, b) => a - b);
 
@@ -132,18 +227,28 @@ function analyzePrices(soldItems) {
     console.log('❌ All prices were filtered as outliers. Check your data.');
     return null;
   }
+  if (filtered.length < MIN_SOLD_SAMPLE) {
+    console.log(
+      `❌ Too few listings after outlier filtering (${filtered.length} kept, need at least ${MIN_SOLD_SAMPLE}).`
+    );
+    return null;
+  }
 
   const filteredSorted = [...filtered].sort((a, b) => a - b);
   const filteredMean = average(filtered);
   const filteredMedian = median(filtered);
-  const filteredStdDev = stdDev(filtered, filteredMean);
-  const cv = filteredStdDev / filteredMean;
+  const filteredStdDevRaw = stdDev(filtered, filteredMean);
+  const hasUsableStdDev =
+    Number.isFinite(filteredStdDevRaw) && filteredStdDevRaw >= MIN_STD_DEV;
+  const filteredStdDev = hasUsableStdDev ? filteredStdDevRaw : 0;
+  const cv = hasUsableStdDev ? filteredStdDev / filteredMean : 0;
 
   const stats = {
     count: filtered.length,
     average: filteredMean,
     median: filteredMedian,
     stdDev: filteredStdDev,
+    hasUsableStdDev,
     cv,
     low: filteredSorted[0],
     high: filteredSorted[filteredSorted.length - 1],
@@ -167,23 +272,36 @@ function analyzePrices(soldItems) {
   // σ price bands
   console.log('\n  📐 PRICE BANDS');
   console.log('─'.repeat(50));
-  console.log(`  -2σ (strong buy): ${formatCurrency(stats.median - 2 * stats.stdDev)}`);
-  console.log(`  -1σ (buy):        ${formatCurrency(stats.median - 1 * stats.stdDev)}`);
-  console.log(`   0  (fair value): ${formatCurrency(stats.median)}`);
-  console.log(`  +1σ (overpriced): ${formatCurrency(stats.median + 1 * stats.stdDev)}`);
-  console.log(`  +2σ (avoid):      ${formatCurrency(stats.median + 2 * stats.stdDev)}`);
+  if (stats.hasUsableStdDev) {
+    console.log(`  -2σ (strong buy): ${formatCurrency(stats.median - 2 * stats.stdDev)}`);
+    console.log(`  -1σ (buy):        ${formatCurrency(stats.median - 1 * stats.stdDev)}`);
+    console.log(`   0  (fair value): ${formatCurrency(stats.median)}`);
+    console.log(`  +1σ (overpriced): ${formatCurrency(stats.median + 1 * stats.stdDev)}`);
+    console.log(`  +2σ (avoid):      ${formatCurrency(stats.median + 2 * stats.stdDev)}`);
+  } else {
+    const fallbackPrice = stats.median * (1 - FALLBACK_DISCOUNT_RATE);
+    console.log(
+      `  ⚠ Std deviation is below ${MIN_STD_DEV}; using discount scoring instead of z-score.`
+    );
+    console.log(
+      `  Discount threshold (${(FALLBACK_DISCOUNT_RATE * 100).toFixed(0)}% below median): ${formatCurrency(fallbackPrice)}`
+    );
+  }
   console.log('─'.repeat(50));
 
   // Market quality verdict
   let marketVerdict;
-  if (cv < 0.3) {
+  if (!stats.hasUsableStdDev) {
+    marketVerdict = '⚠️  Very low variance — using discount-based scoring';
+  } else if (cv < 0.3) {
     marketVerdict = '✅ Tight market — good for arbitrage';
   } else if (cv < 0.5) {
     marketVerdict = '⚠️  Moderate spread — proceed with caution';
   } else {
     marketVerdict = '❌ High variance — no reliable fair value';
   }
-  console.log(`\n  CV: ${cv.toFixed(3)}  →  ${marketVerdict}`);
+  const cvDisplay = stats.hasUsableStdDev ? cv.toFixed(3) : 'N/A';
+  console.log(`\n  CV: ${cvDisplay}  →  ${marketVerdict}`);
   console.log('─'.repeat(50));
 
   return stats;
@@ -197,46 +315,126 @@ async function enrichDealsWithDetails(deals) {
     `\n📦 Enriching top ${topDeals.length} deals with sold quantity data...\n`
   );
 
-  const enriched = [];
+  const soldByItemId = new Map();
   for (const deal of topDeals) {
     try {
-      const details = await eBay.buy.browse.getItem(deal.itemId);
+      const details = await callApiWithRetry(
+        `Browse sold quantity for ${deal.itemId}`,
+        () => eBay.buy.browse.getItem(deal.itemId)
+      );
       const soldQty =
-        details?.estimatedAvailabilities?.[0]?.estimatedSoldQuantity || 0;
-      enriched.push({ ...deal, soldQuantity: soldQty });
-    } catch {
-      enriched.push({ ...deal, soldQuantity: 0 });
+        details?.estimatedAvailabilities?.[0]?.estimatedSoldQuantity;
+      soldByItemId.set(deal.itemId, typeof soldQty === 'number' ? soldQty : 0);
+    } catch (err) {
+      soldByItemId.set(deal.itemId, null);
+      console.warn(
+        `⚠ Sold quantity enrichment failed for ${deal.itemId}: ${errorMessage(err)}`
+      );
     }
   }
 
-  return enriched;
+  return deals.map((deal) => ({
+    ...deal,
+    soldQuantity: soldByItemId.has(deal.itemId)
+      ? soldByItemId.get(deal.itemId)
+      : null,
+  }));
 }
 
 // ─── Step 3b: Get full listing details for LLM evaluation ───────
+function toArray(value) {
+  if (value == null) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
 async function getListingDetails(itemId) {
-  // Extract numeric ID from Browse API format (e.g. "v1|123456|0" → "123456")
-  const numericId = itemId.includes('|') ? itemId.split('|')[1] : itemId;
+  let browseItem = null;
+  try {
+    browseItem = await callApiWithRetry(`Browse details for ${itemId}`, () =>
+      eBay.buy.browse.getItem(itemId)
+    );
+  } catch (err) {
+    console.warn(
+      `⚠ Browse detail lookup failed for ${itemId}: ${errorMessage(err)}`
+    );
+  }
 
-  const result = await eBay.shopping.GetSingleItem({
-    ItemID: numericId,
-    IncludeSelector: 'Details,Description,ItemSpecifics',
-  });
+  const browseDetails = browseItem
+    ? {
+        title: browseItem.title || '',
+        description: browseItem.description || browseItem.shortDescription || '',
+        imageUrls: [
+          browseItem?.image?.imageUrl,
+          ...toArray(browseItem?.additionalImages).map((img) => img?.imageUrl),
+        ].filter(Boolean),
+        conditionDescription: browseItem.conditionDescription || '',
+        conditionName: browseItem.condition || '',
+        itemSpecifics: toArray(browseItem?.localizedAspects).map((aspect) => ({
+          Name: aspect?.name || '',
+          Value: toArray(aspect?.value).filter(Boolean),
+        })),
+        seller: {
+          userId: browseItem?.seller?.username || '',
+          feedbackScore: browseItem?.seller?.feedbackScore || 0,
+          positiveFeedbackPercent:
+            browseItem?.seller?.feedbackPercentage || 0,
+        },
+      }
+    : null;
 
-  const item = result?.Item || result;
+  const legacyItemId =
+    browseItem?.legacyItemId ||
+    (itemId.includes('|') ? itemId.split('|')[1] : itemId);
 
-  return {
-    title: item?.Title || '',
-    description: item?.Description || '',
-    imageUrls: item?.PictureURL || [],
-    conditionDescription: item?.ConditionDescription || '',
-    conditionName: item?.ConditionDisplayName || '',
-    itemSpecifics: item?.ItemSpecifics?.NameValueList || [],
-    seller: {
-      userId: item?.Seller?.UserID || '',
-      feedbackScore: item?.Seller?.FeedbackScore || 0,
-      positiveFeedbackPercent: item?.Seller?.PositiveFeedbackPercent || 0,
-    },
-  };
+  if (!legacyItemId) {
+    if (browseDetails) return browseDetails;
+    throw new Error(`Unable to resolve a legacy item ID for ${itemId}`);
+  }
+
+  try {
+    const result = await callApiWithRetry(
+      `Shopping details for ${legacyItemId}`,
+      () =>
+        eBay.shopping.GetSingleItem({
+          ItemID: legacyItemId,
+          IncludeSelector: 'Details,Description,ItemSpecifics',
+        })
+    );
+
+    const item = result?.Item || result;
+    const shoppingImages = toArray(item?.PictureURL).filter(Boolean);
+
+    return {
+      title: item?.Title || browseDetails?.title || '',
+      description: item?.Description || browseDetails?.description || '',
+      imageUrls:
+        shoppingImages.length > 0
+          ? shoppingImages
+          : browseDetails?.imageUrls || [],
+      conditionDescription:
+        item?.ConditionDescription || browseDetails?.conditionDescription || '',
+      conditionName: item?.ConditionDisplayName || browseDetails?.conditionName || '',
+      itemSpecifics:
+        item?.ItemSpecifics?.NameValueList || browseDetails?.itemSpecifics || [],
+      seller: {
+        userId: item?.Seller?.UserID || browseDetails?.seller?.userId || '',
+        feedbackScore:
+          item?.Seller?.FeedbackScore ?? browseDetails?.seller?.feedbackScore ?? 0,
+        positiveFeedbackPercent:
+          item?.Seller?.PositiveFeedbackPercent ??
+          browseDetails?.seller?.positiveFeedbackPercent ??
+          0,
+      },
+    };
+  } catch (err) {
+    console.warn(
+      `⚠ Shopping detail lookup failed for ${legacyItemId}: ${errorMessage(err)}`
+    );
+    if (browseDetails) return browseDetails;
+    throw new Error(
+      `Unable to load listing details for ${itemId}: ${errorMessage(err)}`
+    );
+  }
 }
 
 // ─── Step 3c: Evaluate a single listing with Azure OpenAI ───────
@@ -254,6 +452,42 @@ function getLLMClient() {
   return llmClient;
 }
 
+const VALID_LLM_VERDICTS = new Set(['BUY', 'RISKY', 'PASS']);
+
+function parseLLMEvaluationResponse(content) {
+  if (typeof content !== 'string' || content.trim().length === 0) {
+    throw new Error('LLM returned an empty response payload.');
+  }
+
+  const parsed = JSON.parse(content);
+  const verdict =
+    typeof parsed.verdict === 'string' ? parsed.verdict.toUpperCase() : '';
+  const confidence = Number(parsed.confidence);
+
+  if (!VALID_LLM_VERDICTS.has(verdict)) {
+    throw new Error(`Invalid LLM verdict: ${parsed.verdict}`);
+  }
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 100) {
+    throw new Error(`Invalid LLM confidence: ${parsed.confidence}`);
+  }
+  if (
+    !Array.isArray(parsed.issues) ||
+    parsed.issues.some((issue) => typeof issue !== 'string')
+  ) {
+    throw new Error('Invalid LLM issues payload.');
+  }
+  if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
+    throw new Error('Invalid LLM summary payload.');
+  }
+
+  return {
+    verdict,
+    confidence: Math.round(confidence),
+    issues: parsed.issues.map((issue) => issue.trim()).filter(Boolean),
+    summary: parsed.summary.trim(),
+  };
+}
+
 async function evaluateListingWithLLM(listingDetails, dealContext) {
   const client = getLLMClient();
   const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
@@ -268,6 +502,12 @@ async function evaluateListingWithLLM(listingDetails, dealContext) {
   const itemSpecsText = listingDetails.itemSpecifics
     .map((spec) => `${spec.Name}: ${Array.isArray(spec.Value) ? spec.Value.join(', ') : spec.Value}`)
     .join('\n');
+
+  const zScoreContext =
+    typeof dealContext.zScore === 'number'
+      ? `${dealContext.zScore.toFixed(2)} (negative = below market)`
+      : 'N/A (market variance too low for z-score)';
+  const discountContext = `${dealContext.discountPct.toFixed(1)}% below median`;
 
   // Build content array: text context + images
   const content = [
@@ -289,7 +529,8 @@ ${plainDescription || 'No description provided'}
 DEAL CONTEXT:
 - Listed price: $${dealContext.price.toFixed(2)}
 - Market median: $${dealContext.marketMedian.toFixed(2)}
-- Z-score: ${dealContext.zScore.toFixed(2)} (negative = below market)
+- Z-score: ${zScoreContext}
+- Discount vs median: ${discountContext}
 - Estimated net profit: $${dealContext.netProfit.toFixed(2)}
 
 EVALUATE THIS LISTING FOR:
@@ -315,44 +556,54 @@ EVALUATE THIS LISTING FOR:
     }
   }
 
-  const response = await client.chat.completions.create({
-    model: deployment,
-    messages: [{ role: 'user', content }],
-    max_tokens: 800,
-    response_format: {
-      type: 'json_schema',
-      json_schema: {
-        name: 'listing_evaluation',
-        strict: true,
-        schema: {
-          type: 'object',
-          properties: {
-            verdict: {
-              type: 'string',
-              description: 'BUY = safe to purchase for resale, RISKY = proceed with caution, PASS = do not buy',
-            },
-            confidence: {
-              type: 'number',
-              description: 'Confidence in verdict from 0-100',
-            },
-            issues: {
-              type: 'array',
-              items: { type: 'string' },
-              description: 'List of specific issues found',
-            },
-            summary: {
-              type: 'string',
-              description: 'One-sentence summary of the evaluation',
+  const response = await callApiWithRetry(
+    `Azure OpenAI listing evaluation for ${listingDetails.title.slice(0, 30) || 'listing'}`,
+    () =>
+      client.chat.completions.create({
+        model: deployment,
+        messages: [{ role: 'user', content }],
+        max_tokens: 800,
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'listing_evaluation',
+            strict: true,
+            schema: {
+              type: 'object',
+              properties: {
+                verdict: {
+                  type: 'string',
+                  enum: ['BUY', 'RISKY', 'PASS'],
+                  description:
+                    'BUY = safe to purchase for resale, RISKY = proceed with caution, PASS = do not buy',
+                },
+                confidence: {
+                  type: 'number',
+                  minimum: 0,
+                  maximum: 100,
+                  description: 'Confidence in verdict from 0-100',
+                },
+                issues: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'List of specific issues found',
+                },
+                summary: {
+                  type: 'string',
+                  description: 'One-sentence summary of the evaluation',
+                },
+              },
+              required: ['verdict', 'confidence', 'issues', 'summary'],
+              additionalProperties: false,
             },
           },
-          required: ['verdict', 'confidence', 'issues', 'summary'],
-          additionalProperties: false,
         },
-      },
-    },
-  });
+      }),
+    { timeoutMs: LLM_TIMEOUT_MS }
+  );
 
-  return JSON.parse(response.choices[0].message.content);
+  const responseContent = response?.choices?.[0]?.message?.content;
+  return parseLLMEvaluationResponse(responseContent);
 }
 
 // ─── Step 3d: Evaluate all deals with LLM ───────────────────────
@@ -386,6 +637,7 @@ async function evaluateDealsWithLLM(deals, marketStats) {
         price: deal.price,
         marketMedian: marketStats.median,
         zScore: deal.zScore,
+        discountPct: deal.discountPct,
         netProfit: deal.netProfit,
       });
 
@@ -402,8 +654,8 @@ async function evaluateDealsWithLLM(deals, marketStats) {
       deal.llmVerdict = 'N/A';
       deal.llmConfidence = 0;
       deal.llmIssues = [];
-      deal.llmSummary = `Error: ${err.message}`;
-      console.log(`⚪ Error: ${err.message.substring(0, 60)}`);
+      deal.llmSummary = `Error: ${errorMessage(err)}`;
+      console.log(`⚪ Error: ${errorMessage(err).substring(0, 60)}`);
     }
   }
 
@@ -412,22 +664,30 @@ async function evaluateDealsWithLLM(deals, marketStats) {
 
 // ─── Step 3b: Find underpriced active listings ──────────────────
 async function findDeals(query, condition, marketStats) {
-  const maxPrice = Math.floor(
-    marketStats.median + MIN_Z_SCORE * marketStats.stdDev
-  );
+  const hasUsableStdDev = marketStats.hasUsableStdDev;
+  const rawMaxPrice = hasUsableStdDev
+    ? marketStats.median + MIN_Z_SCORE * marketStats.stdDev
+    : marketStats.median * (1 - FALLBACK_DISCOUNT_RATE);
+  const maxPrice = Math.max(1, Math.floor(rawMaxPrice));
+  const conditionFilter = normalizeBrowseCondition(condition);
+  const thresholdExplanation = hasUsableStdDev
+    ? `(z ≤ ${MIN_Z_SCORE}, i.e. ${Math.abs(MIN_Z_SCORE)}σ below ${formatCurrency(marketStats.median)} median)`
+    : `(${(FALLBACK_DISCOUNT_RATE * 100).toFixed(0)}% below ${formatCurrency(marketStats.median)} median fallback)`;
 
   console.log(
     `\n🔎 Searching active listings under ${formatCurrency(maxPrice)} ` +
-      `(z ≤ ${MIN_Z_SCORE}, i.e. ${Math.abs(MIN_Z_SCORE)}σ below ${formatCurrency(marketStats.median)} median)...\n`
+      `${thresholdExplanation}...\n`
   );
 
   try {
-    const results = await eBay.buy.browse.search({
-      q: query,
-      filter: `conditions:{${condition.toUpperCase()}},price:[..${maxPrice}],priceCurrency:USD`,
-      sort: 'price',
-      limit: '50',
-    });
+    const results = await callApiWithRetry(`Browse search for "${query}"`, () =>
+      eBay.buy.browse.search({
+        q: query,
+        filter: `buyingOptions:{FIXED_PRICE},conditions:{${conditionFilter}},price:[..${maxPrice}],priceCurrency:USD`,
+        sort: 'price',
+        limit: '50',
+      })
+    );
 
     const items = results?.itemSummaries;
     if (!items || items.length === 0) {
@@ -435,37 +695,60 @@ async function findDeals(query, condition, marketStats) {
       return [];
     }
 
-    const deals = items.map((item) => {
-      const price = parseFloat(item.price.value);
-      const zScore = (price - marketStats.median) / marketStats.stdDev;
-      const grossProfit = marketStats.median - price;
-      const fees = marketStats.median * EBAY_FEE_RATE;
-      const netProfit = grossProfit - fees;
+    const deals = items
+      .map((item) => {
+        const price = parseFloat(item?.price?.value);
+        if (!Number.isFinite(price) || price <= 0) return null;
 
-      let signal;
-      if (zScore <= -2) signal = '🔥 Strong buy';
-      else if (zScore <= -1) signal = '✅ Buy';
-      else signal = '⚠️  Marginal';
+        const discountPct =
+          ((marketStats.median - price) / marketStats.median) * 100;
+        const zScore = hasUsableStdDev
+          ? (price - marketStats.median) / marketStats.stdDev
+          : null;
+        const priceScore = hasUsableStdDev ? zScore : -discountPct;
+        const grossProfit = marketStats.median - price;
+        const fees = marketStats.median * EBAY_FEE_RATE;
+        const netProfit = grossProfit - fees;
 
-      return {
-        itemId: item.itemId,
-        title: item.title,
-        price,
-        zScore,
-        signal,
-        grossProfit,
-        netProfit,
-        link: item.itemWebUrl,
-      };
-    });
+        let signal;
+        if (hasUsableStdDev) {
+          if (zScore <= -2) signal = '🔥 Strong buy';
+          else if (zScore <= -1) signal = '✅ Buy';
+          else signal = '⚠️  Marginal';
+        } else {
+          if (discountPct >= 20) signal = '🔥 Strong buy';
+          else if (discountPct >= 10) signal = '✅ Buy';
+          else signal = '⚠️  Marginal';
+        }
 
-    // Sort by z-score first, then enrich top deals with sold quantity
-    deals.sort((a, b) => a.zScore - b.zScore);
+        return {
+          itemId: item.itemId,
+          title: item.title,
+          price,
+          zScore,
+          discountPct,
+          priceScore,
+          signal,
+          grossProfit,
+          netProfit,
+          link: item.itemWebUrl,
+        };
+      })
+      .filter(Boolean);
+
+    if (deals.length === 0) {
+      console.log('😕 No listings with valid price data were returned.\n');
+      return [];
+    }
+
+    // Sort by score first, then enrich top deals with sold quantity
+    deals.sort((a, b) => a.priceScore - b.priceScore);
     const enrichedDeals = await enrichDealsWithDetails(deals);
 
-    // Composite score: z-score adjusted by sold volume
+    // Composite score: price score adjusted by sold volume
     enrichedDeals.forEach((deal) => {
-      deal.compositeScore = deal.zScore - 0.1 * deal.soldQuantity;
+      const soldForScore = typeof deal.soldQuantity === 'number' ? deal.soldQuantity : 0;
+      deal.compositeScore = deal.priceScore - 0.1 * soldForScore;
     });
     enrichedDeals.sort((a, b) => a.compositeScore - b.compositeScore);
 
@@ -473,10 +756,11 @@ async function findDeals(query, condition, marketStats) {
     await evaluateDealsWithLLM(enrichedDeals, marketStats);
 
     const hasLLM = enrichedDeals.some((d) => d.llmVerdict && d.llmVerdict !== 'N/A');
+    const scoreHeader = hasUsableStdDev ? 'Z-SCORE' : 'DISC%';
 
-    console.log(`\n🔥 Top ${enrichedDeals.length} deals (ranked by z-score + volume):\n`);
+    console.log(`\n🔥 Top ${enrichedDeals.length} deals (ranked by price score + volume):\n`);
     const header =
-      'Z-SCORE'.padEnd(10) +
+      scoreHeader.padEnd(10) +
       'SOLD'.padEnd(7) +
       (hasLLM ? 'VERDICT'.padEnd(14) : '') +
       'SIGNAL'.padEnd(16) +
@@ -496,10 +780,15 @@ async function findDeals(query, condition, marketStats) {
           deal.llmVerdict === 'PASS' ? '🔴' : '⚪';
         verdictCol = `${icon} ${deal.llmVerdict || 'N/A'}`.padEnd(14);
       }
+      const scoreCol = hasUsableStdDev
+        ? deal.zScore.toFixed(2)
+        : `${deal.discountPct.toFixed(1)}%`;
+      const soldCol =
+        typeof deal.soldQuantity === 'number' ? String(deal.soldQuantity) : '?';
 
       console.log(
-        deal.zScore.toFixed(2).padEnd(10) +
-          String(deal.soldQuantity).padEnd(7) +
+        scoreCol.padEnd(10) +
+          soldCol.padEnd(7) +
           verdictCol +
           deal.signal.padEnd(16) +
           formatCurrency(deal.price).padEnd(10) +
@@ -510,11 +799,13 @@ async function findDeals(query, condition, marketStats) {
     });
 
     console.log('\n' + '─'.repeat(hasLLM ? 149 : 135));
+    if (hasUsableStdDev) {
+      console.log(`\n💡 Z-SCORE = (listing price - median) / std dev`);
+    } else {
+      console.log(`\n💡 DISC% = ((median - listing price) / median) × 100`);
+    }
     console.log(
-      `\n💡 Z-SCORE = (listing price - median) / std dev`
-    );
-    console.log(
-      `   SOLD = units sold on this active listing (validated demand)`
+      `   SOLD = units sold on this active listing (validated demand, ? = not enriched)`
     );
     if (hasLLM) {
       console.log(
@@ -522,7 +813,7 @@ async function findDeals(query, condition, marketStats) {
       );
     }
     console.log(
-      `   Ranking = z-score adjusted by sold volume (high-volume deals rank higher)`
+      `   Ranking = price score adjusted by sold volume (high-volume deals rank higher)`
     );
     console.log(
       `   NET PROFIT = (median - price) minus ~${EBAY_FEE_RATE * 100}% eBay fees (shipping not included)\n`
@@ -539,8 +830,11 @@ async function findDeals(query, condition, marketStats) {
           const icon =
             deal.llmVerdict === 'BUY' ? '🟢' :
             deal.llmVerdict === 'RISKY' ? '🟡' : '🔴';
+          const scoreSummary = hasUsableStdDev
+            ? `Z: ${deal.zScore.toFixed(2)}`
+            : `Discount: ${deal.discountPct.toFixed(1)}%`;
           console.log(`\n  ${icon} [${i + 1}] ${deal.title.substring(0, 60)}`);
-          console.log(`     Price: ${formatCurrency(deal.price)} | Z: ${deal.zScore.toFixed(2)} | Confidence: ${deal.llmConfidence}%`);
+          console.log(`     Price: ${formatCurrency(deal.price)} | ${scoreSummary} | Confidence: ${deal.llmConfidence}%`);
           console.log(`     ${deal.llmSummary}`);
           if (deal.llmIssues?.length > 0) {
             deal.llmIssues.forEach((issue) => {
@@ -553,7 +847,7 @@ async function findDeals(query, condition, marketStats) {
 
     return enrichedDeals;
   } catch (err) {
-    console.error('Error searching active listings:', err.message);
+    console.error('Error searching active listings:', errorMessage(err));
     return [];
   }
 }

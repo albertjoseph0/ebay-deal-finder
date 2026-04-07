@@ -2,6 +2,10 @@
 
 Find underpriced eBay listings by comparing against recent sold prices, with optional AI-powered listing evaluation.
 
+## Prerequisites
+
+- **Node.js 20.6+** (required for `node --env-file`)
+
 ## Setup
 
 1. **Get eBay API keys** at [developer.ebay.com](https://developer.ebay.com)
@@ -18,7 +22,12 @@ Find underpriced eBay listings by comparing against recent sold prices, with opt
    npm install
    ```
 
-4. **Run it**
+4. **Lint**
+   ```bash
+   npm run lint
+   ```
+
+5. **Run it**
    ```bash
    npm start
    ```
@@ -29,9 +38,9 @@ Find underpriced eBay listings by comparing against recent sold prices, with opt
 2. Removes outliers using **IQR filtering**
 3. Calculates **median, standard deviation, and coefficient of variation (CV)**
 4. Assesses **market quality** — is this product viable for arbitrage?
-5. Searches **active listings** priced below a z-score threshold
+5. Searches **active fixed-price listings** below a z-score threshold *(or discount fallback when variance is too low)*
 6. Enriches top deals with **sold quantity** data from Browse API
-7. Ranks deals by **composite score** (z-score + volume)
+7. Ranks deals by **composite score** (price score + volume)
 8. *(Optional)* Evaluates each deal with **Azure OpenAI GPT-5.4-mini** — analyzes listing photos, description, and seller quality
 
 ## LLM Evaluation (Optional)
@@ -66,7 +75,9 @@ Edit the constants at the top of `src/index.js`:
 |----------|---------|-------------|
 | `SEARCH_QUERY` | `'TI-84 Plus calculator'` | What to search for |
 | `CONDITION` | `'Used'` | Item condition filter |
-| `MIN_Z_SCORE` | `-1.0` | Show listings at or below this z-score (1σ under median) |
+| `MIN_Z_SCORE` | `-1.0` | Z-score cutoff when market variance is usable |
+| `MIN_SOLD_SAMPLE` | `20` | Minimum sold-listing sample required for reliable pricing |
+| `FALLBACK_DISCOUNT_RATE` | `0.1` | Discount cutoff used when variance is too low for z-score |
 | `EBAY_FEE_RATE` | `0.13` | eBay seller fee estimate (~13%) |
 | `MAX_ENRICH` | `20` | How many deals to enrich with sold quantity |
 | `MAX_LLM_EVAL` | `10` | How many deals to evaluate with LLM |
