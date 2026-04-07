@@ -1,0 +1,13 @@
+{
+  "name": "ebay-deal-finder",
+  "version": "1.0.0",
+  "description": "Find underpriced eBay listings by comparing against recent sold prices",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env src/index.js",
+    "search": "node --env-file=.env src/index.js"
+  },
+  "dependencies": {
+    "ebay-api": "^9.1.1"
+  }
+}
