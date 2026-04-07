@@ -3,7 +3,7 @@ import eBayApi from 'ebay-api';
 // ─── Configuration ──────────────────────────────────────────────
 const SEARCH_QUERY = 'TI-84 Plus calculator';
 const CONDITION = 'Used';
-const DEAL_THRESHOLD = 0.65; // Flag items at 65% or less of median price
+const MIN_Z_SCORE = -1.0; // Show listings at or below 1 std dev under median
 const EBAY_FEE_RATE = 0.13; // ~13% eBay seller fees
 const RESULTS_PER_PAGE = 100;
 
@@ -43,6 +43,11 @@ function filterOutliers(prices) {
     upper,
     removedCount: prices.length - filtered.length,
   };
+}
+
+function stdDev(numbers, mean) {
+  const squaredDiffs = numbers.map((n) => (n - mean) ** 2);
+  return Math.sqrt(squaredDiffs.reduce((a, b) => a + b, 0) / numbers.length);
 }
 
 // ─── Step 1: Get sold prices (market value) ─────────────────────
@@ -125,10 +130,17 @@ function analyzePrices(soldItems) {
   }
 
   const filteredSorted = [...filtered].sort((a, b) => a - b);
+  const filteredMean = average(filtered);
+  const filteredMedian = median(filtered);
+  const filteredStdDev = stdDev(filtered, filteredMean);
+  const cv = filteredStdDev / filteredMean;
+
   const stats = {
     count: filtered.length,
-    average: average(filtered),
-    median: median(filtered),
+    average: filteredMean,
+    median: filteredMedian,
+    stdDev: filteredStdDev,
+    cv,
     low: filteredSorted[0],
     high: filteredSorted[filteredSorted.length - 1],
     p25: filteredSorted[Math.floor(filteredSorted.length * 0.25)],
@@ -142,9 +154,32 @@ function analyzePrices(soldItems) {
   console.log('─'.repeat(50));
   console.log(`  Items kept:      ${stats.count} of ${prices.length}`);
   console.log(`  Average price:   ${formatCurrency(stats.average)}`);
-  console.log(`  Median price:    ${formatCurrency(stats.median)}  ← used for deal finding`);
+  console.log(`  Median price:    ${formatCurrency(stats.median)}`);
+  console.log(`  Std deviation:   ${formatCurrency(stats.stdDev)}`);
   console.log(`  Low / High:      ${formatCurrency(stats.low)} — ${formatCurrency(stats.high)}`);
   console.log(`  25th / 75th pct: ${formatCurrency(stats.p25)} — ${formatCurrency(stats.p75)}`);
+  console.log('─'.repeat(50));
+
+  // σ price bands
+  console.log('\n  📐 PRICE BANDS');
+  console.log('─'.repeat(50));
+  console.log(`  -2σ (strong buy): ${formatCurrency(stats.median - 2 * stats.stdDev)}`);
+  console.log(`  -1σ (buy):        ${formatCurrency(stats.median - 1 * stats.stdDev)}`);
+  console.log(`   0  (fair value): ${formatCurrency(stats.median)}`);
+  console.log(`  +1σ (overpriced): ${formatCurrency(stats.median + 1 * stats.stdDev)}`);
+  console.log(`  +2σ (avoid):      ${formatCurrency(stats.median + 2 * stats.stdDev)}`);
+  console.log('─'.repeat(50));
+
+  // Market quality verdict
+  let marketVerdict;
+  if (cv < 0.3) {
+    marketVerdict = '✅ Tight market — good for arbitrage';
+  } else if (cv < 0.5) {
+    marketVerdict = '⚠️  Moderate spread — proceed with caution';
+  } else {
+    marketVerdict = '❌ High variance — no reliable fair value';
+  }
+  console.log(`\n  CV: ${cv.toFixed(3)}  →  ${marketVerdict}`);
   console.log('─'.repeat(50));
 
   return stats;
@@ -152,11 +187,13 @@ function analyzePrices(soldItems) {
 
 // ─── Step 3: Find underpriced active listings ───────────────────
 async function findDeals(query, condition, marketStats) {
-  const maxPrice = Math.floor(marketStats.median * DEAL_THRESHOLD);
+  const maxPrice = Math.floor(
+    marketStats.median + MIN_Z_SCORE * marketStats.stdDev
+  );
 
   console.log(
     `\n🔎 Searching active listings under ${formatCurrency(maxPrice)} ` +
-      `(${DEAL_THRESHOLD * 100}% of ${formatCurrency(marketStats.median)} median)...\n`
+      `(z ≤ ${MIN_Z_SCORE}, i.e. ${Math.abs(MIN_Z_SCORE)}σ below ${formatCurrency(marketStats.median)} median)...\n`
   );
 
   try {
@@ -175,51 +212,58 @@ async function findDeals(query, condition, marketStats) {
 
     console.log(`🔥 Found ${items.length} potential deals:\n`);
     console.log(
-      'PRICE'.padEnd(10) +
-        'PROFIT'.padEnd(12) +
-        'AFTER FEES'.padEnd(12) +
-        'TITLE'.padEnd(55) +
+      'Z-SCORE'.padEnd(10) +
+        'SIGNAL'.padEnd(16) +
+        'PRICE'.padEnd(10) +
+        'NET PROFIT'.padEnd(12) +
+        'TITLE'.padEnd(50) +
         'LINK'
     );
-    console.log('─'.repeat(120));
+    console.log('─'.repeat(130));
 
     const deals = items.map((item) => {
       const price = parseFloat(item.price.value);
+      const zScore = (price - marketStats.median) / marketStats.stdDev;
       const grossProfit = marketStats.median - price;
       const fees = marketStats.median * EBAY_FEE_RATE;
       const netProfit = grossProfit - fees;
 
+      let signal;
+      if (zScore <= -2) signal = '🔥 Strong buy';
+      else if (zScore <= -1) signal = '✅ Buy';
+      else signal = '⚠️  Marginal';
+
       return {
         title: item.title,
         price,
+        zScore,
+        signal,
         grossProfit,
         netProfit,
-        condition: item.condition,
         link: item.itemWebUrl,
-        seller: item.seller?.username || 'N/A',
       };
     });
 
-    // Sort by net profit descending
-    deals.sort((a, b) => b.netProfit - a.netProfit);
+    // Sort by z-score ascending (most underpriced first)
+    deals.sort((a, b) => a.zScore - b.zScore);
 
     deals.forEach((deal) => {
-      const profitColor = deal.netProfit > 0 ? '✅' : '⚠️';
       console.log(
-        formatCurrency(deal.price).padEnd(10) +
-          formatCurrency(deal.grossProfit).padEnd(12) +
-          `${profitColor} ${formatCurrency(deal.netProfit)}`.padEnd(12) +
-          deal.title.substring(0, 52).padEnd(55) +
+        deal.zScore.toFixed(2).padEnd(10) +
+          deal.signal.padEnd(16) +
+          formatCurrency(deal.price).padEnd(10) +
+          `${deal.netProfit > 0 ? '+' : ''}${formatCurrency(deal.netProfit)}`.padEnd(12) +
+          deal.title.substring(0, 47).padEnd(50) +
           deal.link
       );
     });
 
-    console.log('\n─'.repeat(120));
+    console.log('\n' + '─'.repeat(130));
     console.log(
-      `\n💡 "PROFIT" = median sold price - listing price`
+      `\n💡 Z-SCORE = (listing price - median) / std dev`
     );
     console.log(
-      `   "AFTER FEES" = profit minus ~${EBAY_FEE_RATE * 100}% eBay fees (shipping costs not included)\n`
+      `   NET PROFIT = (median - price) minus ~${EBAY_FEE_RATE * 100}% eBay fees (shipping not included)\n`
     );
 
     return deals;
@@ -236,7 +280,7 @@ async function main() {
   console.log('═'.repeat(50));
   console.log(`  Query:     "${SEARCH_QUERY}"`);
   console.log(`  Condition: ${CONDITION}`);
-  console.log(`  Threshold: ${DEAL_THRESHOLD * 100}% of median`);
+  console.log(`  Min z:     ${MIN_Z_SCORE} (${Math.abs(MIN_Z_SCORE)}σ below median)`);
   console.log('═'.repeat(50));
 
   // Step 1: Get sold data

@@ -26,9 +26,11 @@ Find underpriced eBay listings by comparing against recent sold prices.
 ## How It Works
 
 1. Pulls ~90 days of **sold listings** via the Finding API
-2. Calculates **median/average market price** by condition
-3. Searches **active listings** priced below a threshold (default: 65% of median)
-4. Shows potential **profit after eBay fees**
+2. Removes outliers using **IQR filtering**
+3. Calculates **median, standard deviation, and coefficient of variation (CV)**
+4. Assesses **market quality** — is this product viable for arbitrage?
+5. Searches **active listings** priced below a z-score threshold
+6. Ranks deals by **z-score** (how many std devs below fair value)
 
 ## Configuration
 
@@ -38,5 +40,5 @@ Edit the constants at the top of `src/index.js`:
 |----------|---------|-------------|
 | `SEARCH_QUERY` | `'TI-84 Plus calculator'` | What to search for |
 | `CONDITION` | `'Used'` | Item condition filter |
-| `DEAL_THRESHOLD` | `0.65` | Flag items at this % of median or lower |
+| `MIN_Z_SCORE` | `-1.0` | Show listings at or below this z-score (1σ under median) |
 | `EBAY_FEE_RATE` | `0.13` | eBay seller fee estimate (~13%) |
