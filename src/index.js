@@ -9,6 +9,7 @@ const MIN_PRICE = 25; // Floor price to exclude accessories
 const MIN_Z_SCORE = -1.0; // Show listings at or below 1 std dev under median
 const EBAY_FEE_RATE = 0.13; // ~13% eBay seller fees
 const RESULTS_PER_PAGE = 200;
+const MAX_LLM_CALLS = 200; // Budget cap: LLM-evaluate the top N deals by composite score
 const MAX_IMAGES_PER_LISTING = 5; // Max images to send to LLM per listing
 const MIN_MARKET_SAMPLE = 20;
 const MIN_STD_DEV = 0.01;
@@ -553,7 +554,15 @@ async function evaluateDealsWithLLM(deals, marketStats) {
     return deals;
   }
 
-  const toEvaluate = deals;
+  const toEvaluate = deals.slice(0, MAX_LLM_CALLS);
+  if (toEvaluate.length < deals.length) {
+    console.log(
+      `  ℹ️  ${deals.length} deals passed the statistical filter; evaluating the top ${toEvaluate.length} by composite score (budget cap: ${MAX_LLM_CALLS}).`
+    );
+    console.log(
+      `     Remaining ${deals.length - toEvaluate.length} deal(s) will use price-signal-only recommendations.\n`
+    );
+  }
   console.log(
     `\n🤖 Evaluating ${toEvaluate.length} deals with Azure OpenAI (${LLM_CONCURRENCY} parallel)...\n`
   );
@@ -721,6 +730,9 @@ async function findDeals(query, condition, marketStats) {
       const soldForScore = typeof deal.soldQuantity === 'number' ? deal.soldQuantity : 0;
       deal.compositeScore = deal.priceScore - 0.1 * soldForScore;
     });
+
+    // Sort by composite score (best deals first) before LLM evaluation
+    enrichedDeals.sort((a, b) => a.compositeScore - b.compositeScore);
 
     // LLM evaluation (if configured)
     await evaluateDealsWithLLM(enrichedDeals, marketStats);
