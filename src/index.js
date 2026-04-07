@@ -140,7 +140,7 @@ async function getMarketListings(query, condition) {
   console.log(`\n📊 Fetching active market listings for "${query}" (${condition})...\n`);
 
   const conditionFilter = normalizeBrowseCondition(condition);
-  const priceFilter = MIN_PRICE > 0 ? `,price:[${MIN_PRICE}],priceCurrency:USD` : ',priceCurrency:USD';
+  const priceFilter = MIN_PRICE > 0 ? `,price:[${MIN_PRICE}..],priceCurrency:USD` : ',priceCurrency:USD';
   const allItems = [];
   const maxPages = 2;
   const pageSize = RESULTS_PER_PAGE;
@@ -334,7 +334,7 @@ async function enrichDealsWithDetails(deals) {
   }));
 }
 
-// ─── Step 3b: Get full listing details for LLM evaluation ───────
+// ─── Step 3c: Get full listing details for LLM evaluation ───────
 function toArray(value) {
   if (value == null) return [];
   return Array.isArray(value) ? value : [value];
@@ -366,7 +366,7 @@ async function getListingDetails(itemId) {
   };
 }
 
-// ─── Step 3c: Evaluate a single listing with Azure OpenAI ───────
+// ─── Step 3d: Evaluate a single listing with Azure OpenAI ───────
 let llmClient = null;
 
 function getLLMClient() {
@@ -538,7 +538,7 @@ EVALUATE THIS LISTING FOR:
   return parseLLMEvaluationResponse(responseContent);
 }
 
-// ─── Step 3d: Evaluate all deals with LLM ───────────────────────
+// ─── Step 3e: Evaluate all deals with LLM ───────────────────────
 const LLM_CONCURRENCY = 5;
 
 async function evaluateDealsWithLLM(deals, marketStats) {
@@ -602,13 +602,23 @@ async function evaluateDealsWithLLM(deals, marketStats) {
   return deals;
 }
 
-// ─── Step 3b: Find underpriced active listings ──────────────────
+// ─── Step 3: Find underpriced active listings ───────────────────
 async function findDeals(query, condition, marketStats) {
   const hasUsableStdDev = marketStats.hasUsableStdDev;
   const rawMaxPrice = hasUsableStdDev
     ? marketStats.median + MIN_Z_SCORE * marketStats.stdDev
     : marketStats.median * (1 - FALLBACK_DISCOUNT_RATE);
   const maxPrice = Math.max(1, Math.floor(rawMaxPrice));
+
+  // Guard: if price floor exceeds the max price threshold, no deals are possible
+  if (MIN_PRICE > 0 && maxPrice < MIN_PRICE) {
+    console.log(
+      `\n😕 No deals possible: price floor ($${MIN_PRICE}) exceeds deal threshold (${formatCurrency(maxPrice)}).` +
+      `\n   The market spread is too tight for arbitrage at this z-score cutoff.\n`
+    );
+    return [];
+  }
+
   const conditionFilter = normalizeBrowseCondition(condition);
   const thresholdExplanation = hasUsableStdDev
     ? `(z ≤ ${MIN_Z_SCORE}, i.e. ${Math.abs(MIN_Z_SCORE)}σ below ${formatCurrency(marketStats.median)} median)`
@@ -688,12 +698,11 @@ async function findDeals(query, condition, marketStats) {
     deals.sort((a, b) => a.priceScore - b.priceScore);
     const enrichedDeals = await enrichDealsWithDetails(deals);
 
-    // Composite score: price score adjusted by sold volume
+    // Composite score: price score adjusted by sold volume (used in final ranking)
     enrichedDeals.forEach((deal) => {
       const soldForScore = typeof deal.soldQuantity === 'number' ? deal.soldQuantity : 0;
       deal.compositeScore = deal.priceScore - 0.1 * soldForScore;
     });
-    enrichedDeals.sort((a, b) => a.compositeScore - b.compositeScore);
 
     // LLM evaluation (if configured)
     await evaluateDealsWithLLM(enrichedDeals, marketStats);
@@ -701,8 +710,51 @@ async function findDeals(query, condition, marketStats) {
     const hasLLM = enrichedDeals.some((d) => d.llmVerdict && d.llmVerdict !== 'N/A');
     const scoreHeader = hasUsableStdDev ? 'Z-SCORE' : 'DISC%';
 
-    console.log(`\n🔥 Top ${enrichedDeals.length} deals (ranked by price score + volume):\n`);
+    // ── Compute final recommendation combining price signal + LLM verdict ──
+    enrichedDeals.forEach((deal) => {
+      const priceRank =
+        deal.signal.includes('Strong') ? 3 :
+        deal.signal.includes('Buy') ? 2 : 1;
+
+      const llmRank =
+        deal.llmVerdict === 'BUY' ? 3 :
+        deal.llmVerdict === 'RISKY' ? 2 :
+        deal.llmVerdict === 'PASS' ? 0 : -1; // N/A or error = -1
+
+      const confidence = deal.llmConfidence || 0;
+
+      // Combined score: price rank (0-3) + LLM rank (0-3) + confidence bonus
+      const effectiveLLMRank = llmRank === -1 ? 0 : llmRank;
+      deal.finalScore = priceRank + effectiveLLMRank + (confidence / 100);
+
+      if (llmRank === 0) {
+        // LLM said PASS — skip regardless of price
+        deal.finalRec = '❌ SKIP';
+      } else if (llmRank === -1) {
+        // LLM failed/skipped — fall back to price signal only
+        deal.finalRec = priceRank >= 3 ? '⚠️  CONSIDER' : priceRank >= 2 ? '⚠️  CONSIDER' : '❌ SKIP';
+      } else if (llmRank === 3 && priceRank >= 2) {
+        deal.finalRec = '🏆 STRONG BUY';
+      } else if (llmRank === 3) {
+        deal.finalRec = '✅ BUY';
+      } else if (llmRank === 2 && priceRank >= 2) {
+        deal.finalRec = '⚠️  CONSIDER';
+      } else if (!hasLLM) {
+        // No LLM configured at all — fall back to price signal only
+        deal.finalRec = priceRank >= 3 ? '✅ BUY' : priceRank >= 2 ? '⚠️  CONSIDER' : '❌ SKIP';
+      } else {
+        deal.finalRec = '❌ SKIP';
+      }
+    });
+
+    // Sort by final score descending (best deals first)
+    enrichedDeals.sort((a, b) => b.finalScore - a.finalScore);
+
+    // ── Full analysis table ──
+    console.log(`\n📊 Full Analysis — ${enrichedDeals.length} deals (best first):\n`);
+    const recCol = hasLLM ? 'RECOMMENDATION'.padEnd(18) : '';
     const header =
+      recCol +
       scoreHeader.padEnd(10) +
       'SOLD'.padEnd(7) +
       (hasLLM ? 'VERDICT'.padEnd(14) : '') +
@@ -712,7 +764,7 @@ async function findDeals(query, condition, marketStats) {
       'TITLE'.padEnd(45) +
       'LINK';
     console.log(header);
-    console.log('─'.repeat(hasLLM ? 149 : 135));
+    console.log('─'.repeat(150));
 
     enrichedDeals.forEach((deal) => {
       let verdictCol = '';
@@ -728,9 +780,11 @@ async function findDeals(query, condition, marketStats) {
         : `${deal.discountPct.toFixed(1)}%`;
       const soldCol =
         typeof deal.soldQuantity === 'number' ? String(deal.soldQuantity) : '?';
+      const recColVal = hasLLM ? deal.finalRec.padEnd(18) : '';
 
       console.log(
-        scoreCol.padEnd(10) +
+        recColVal +
+          scoreCol.padEnd(10) +
           soldCol.padEnd(7) +
           verdictCol +
           deal.signal.padEnd(16) +
@@ -741,52 +795,72 @@ async function findDeals(query, condition, marketStats) {
       );
     });
 
-    console.log('\n' + '─'.repeat(hasLLM ? 149 : 135));
+    console.log('─'.repeat(150));
+
+    // ── Legend ──
+    console.log(`\n💡 Column guide:`);
     if (hasUsableStdDev) {
-      console.log(`\n💡 Z-SCORE = (listing price - median) / std dev`);
+      console.log(`   Z-SCORE  = (price - median) / std dev — lower is cheaper`);
     } else {
-      console.log(`\n💡 DISC% = ((median - listing price) / median) × 100`);
+      console.log(`   DISC%    = ((median - price) / median) × 100`);
     }
-    console.log(
-      `   SOLD = units sold on this active listing (validated demand, ? = not enriched)`
-    );
+    console.log(`   SOLD     = units sold on this listing (demand signal)`);
     if (hasLLM) {
-      console.log(
-        `   VERDICT = LLM evaluation: 🟢 BUY (safe) | 🟡 RISKY (caution) | 🔴 PASS (avoid)`
-      );
+      console.log(`   VERDICT  = LLM photo analysis: 🟢 BUY | 🟡 RISKY | 🔴 PASS`);
+      console.log(`   RECOMMENDATION = combined price + LLM + confidence score`);
     }
-    console.log(
-      `   Ranking = price score adjusted by sold volume (high-volume deals rank higher)`
+    console.log(`   NET PROFIT = (median - price) minus ~${EBAY_FEE_RATE * 100}% eBay fees (excl. shipping)\n`);
+
+    // ── Action Items: only listings worth buying ──
+    const actionable = enrichedDeals.filter(
+      (d) => d.finalRec === '🏆 STRONG BUY' || d.finalRec === '✅ BUY'
     );
-    console.log(
-      `   NET PROFIT = (median - price) minus ~${EBAY_FEE_RATE * 100}% eBay fees (shipping not included)\n`
+    const consider = enrichedDeals.filter(
+      (d) => d.finalRec === '⚠️  CONSIDER'
     );
 
-    // Print detailed LLM summaries if available
-    if (hasLLM) {
-      console.log('═'.repeat(60));
-      console.log('  🤖 DETAILED LLM EVALUATION SUMMARIES');
-      console.log('═'.repeat(60));
-      enrichedDeals
-        .filter((d) => d.llmVerdict && d.llmVerdict !== 'N/A')
-        .forEach((deal, i) => {
-          const icon =
-            deal.llmVerdict === 'BUY' ? '🟢' :
-            deal.llmVerdict === 'RISKY' ? '🟡' : '🔴';
-          const scoreSummary = hasUsableStdDev
-            ? `Z: ${deal.zScore.toFixed(2)}`
-            : `Discount: ${deal.discountPct.toFixed(1)}%`;
-          console.log(`\n  ${icon} [${i + 1}] ${deal.title.substring(0, 60)}`);
-          console.log(`     Price: ${formatCurrency(deal.price)} | ${scoreSummary} | Confidence: ${deal.llmConfidence}%`);
-          console.log(`     ${deal.llmSummary}`);
-          if (deal.llmIssues?.length > 0) {
-            deal.llmIssues.forEach((issue) => {
-              console.log(`     ⚠ ${issue}`);
-            });
-          }
-        });
-      console.log('\n' + '═'.repeat(60));
+    console.log('═'.repeat(70));
+    console.log('  🎯 ACTION ITEMS — Listings to buy NOW');
+    console.log('═'.repeat(70));
+
+    if (actionable.length === 0) {
+      console.log('\n  No strong recommendations right now.');
+      console.log('  The market may be efficiently priced, or all cheap listings have issues.');
+    } else {
+      actionable.forEach((deal, i) => {
+        const rec = deal.finalRec;
+        const scoreSummary = hasUsableStdDev
+          ? `z=${deal.zScore.toFixed(2)}`
+          : `${deal.discountPct.toFixed(1)}% off`;
+        console.log(`\n  ${rec}  [${i + 1}]`);
+        console.log(`  📦 ${deal.title.substring(0, 70)}`);
+        console.log(`  💰 ${formatCurrency(deal.price)} → est. profit ${deal.netProfit > 0 ? '+' : ''}${formatCurrency(deal.netProfit)} (${scoreSummary})`);
+        if (deal.llmSummary) console.log(`  🤖 ${deal.llmSummary}`);
+        console.log(`  🔗 ${deal.link}`);
+      });
     }
+
+    if (consider.length > 0) {
+      console.log('\n' + '─'.repeat(70));
+      console.log('  ⚠️  WORTH CONSIDERING (proceed with caution)');
+      console.log('─'.repeat(70));
+      consider.forEach((deal, i) => {
+        const scoreSummary = hasUsableStdDev
+          ? `z=${deal.zScore.toFixed(2)}`
+          : `${deal.discountPct.toFixed(1)}% off`;
+        console.log(`\n  [${i + 1}] ${deal.title.substring(0, 65)}`);
+        console.log(`      ${formatCurrency(deal.price)} | profit: ${deal.netProfit > 0 ? '+' : ''}${formatCurrency(deal.netProfit)} (${scoreSummary})`);
+        if (deal.llmSummary) console.log(`      🤖 ${deal.llmSummary}`);
+        if (deal.llmIssues?.length > 0) {
+          deal.llmIssues.forEach((issue) => console.log(`      ⚠ ${issue}`));
+        }
+        console.log(`      🔗 ${deal.link}`);
+      });
+    }
+
+    const skipped = enrichedDeals.filter((d) => d.finalRec === '❌ SKIP').length;
+    console.log(`\n  📊 Summary: ${actionable.length} BUY | ${consider.length} CONSIDER | ${skipped} SKIP out of ${enrichedDeals.length} deals`);
+    console.log('═'.repeat(70) + '\n');
 
     return enrichedDeals;
   } catch (err) {
