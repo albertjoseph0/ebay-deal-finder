@@ -6,6 +6,7 @@ const CONDITION = 'Used';
 const MIN_Z_SCORE = -1.0; // Show listings at or below 1 std dev under median
 const EBAY_FEE_RATE = 0.13; // ~13% eBay seller fees
 const RESULTS_PER_PAGE = 100;
+const MAX_ENRICH = 20; // How many top deals to enrich with getItem() details
 
 // ─── Initialize eBay client from .env ───────────────────────────
 const eBay = eBayApi.fromEnv();
@@ -185,7 +186,30 @@ function analyzePrices(soldItems) {
   return stats;
 }
 
-// ─── Step 3: Find underpriced active listings ───────────────────
+// ─── Step 3a: Enrich deals with sold quantity ───────────────────
+async function enrichDealsWithDetails(deals) {
+  const topDeals = deals.slice(0, MAX_ENRICH);
+
+  console.log(
+    `\n📦 Enriching top ${topDeals.length} deals with sold quantity data...\n`
+  );
+
+  const enriched = [];
+  for (const deal of topDeals) {
+    try {
+      const details = await eBay.buy.browse.getItem(deal.itemId);
+      const soldQty =
+        details?.estimatedAvailabilities?.[0]?.estimatedSoldQuantity || 0;
+      enriched.push({ ...deal, soldQuantity: soldQty });
+    } catch {
+      enriched.push({ ...deal, soldQuantity: 0 });
+    }
+  }
+
+  return enriched;
+}
+
+// ─── Step 3b: Find underpriced active listings ──────────────────
 async function findDeals(query, condition, marketStats) {
   const maxPrice = Math.floor(
     marketStats.median + MIN_Z_SCORE * marketStats.stdDev
@@ -210,17 +234,6 @@ async function findDeals(query, condition, marketStats) {
       return [];
     }
 
-    console.log(`🔥 Found ${items.length} potential deals:\n`);
-    console.log(
-      'Z-SCORE'.padEnd(10) +
-        'SIGNAL'.padEnd(16) +
-        'PRICE'.padEnd(10) +
-        'NET PROFIT'.padEnd(12) +
-        'TITLE'.padEnd(50) +
-        'LINK'
-    );
-    console.log('─'.repeat(130));
-
     const deals = items.map((item) => {
       const price = parseFloat(item.price.value);
       const zScore = (price - marketStats.median) / marketStats.stdDev;
@@ -234,6 +247,7 @@ async function findDeals(query, condition, marketStats) {
       else signal = '⚠️  Marginal';
 
       return {
+        itemId: item.itemId,
         title: item.title,
         price,
         zScore,
@@ -244,29 +258,55 @@ async function findDeals(query, condition, marketStats) {
       };
     });
 
-    // Sort by z-score ascending (most underpriced first)
+    // Sort by z-score first, then enrich top deals with sold quantity
     deals.sort((a, b) => a.zScore - b.zScore);
+    const enrichedDeals = await enrichDealsWithDetails(deals);
 
-    deals.forEach((deal) => {
+    // Composite score: z-score adjusted by sold volume
+    enrichedDeals.forEach((deal) => {
+      deal.compositeScore = deal.zScore - 0.1 * deal.soldQuantity;
+    });
+    enrichedDeals.sort((a, b) => a.compositeScore - b.compositeScore);
+
+    console.log(`🔥 Top ${enrichedDeals.length} deals (ranked by z-score + volume):\n`);
+    console.log(
+      'Z-SCORE'.padEnd(10) +
+        'SOLD'.padEnd(7) +
+        'SIGNAL'.padEnd(16) +
+        'PRICE'.padEnd(10) +
+        'NET PROFIT'.padEnd(12) +
+        'TITLE'.padEnd(45) +
+        'LINK'
+    );
+    console.log('─'.repeat(135));
+
+    enrichedDeals.forEach((deal) => {
       console.log(
         deal.zScore.toFixed(2).padEnd(10) +
+          String(deal.soldQuantity).padEnd(7) +
           deal.signal.padEnd(16) +
           formatCurrency(deal.price).padEnd(10) +
           `${deal.netProfit > 0 ? '+' : ''}${formatCurrency(deal.netProfit)}`.padEnd(12) +
-          deal.title.substring(0, 47).padEnd(50) +
+          deal.title.substring(0, 42).padEnd(45) +
           deal.link
       );
     });
 
-    console.log('\n' + '─'.repeat(130));
+    console.log('\n' + '─'.repeat(135));
     console.log(
       `\n💡 Z-SCORE = (listing price - median) / std dev`
+    );
+    console.log(
+      `   SOLD = units sold on this active listing (validated demand)`
+    );
+    console.log(
+      `   Ranking = z-score adjusted by sold volume (high-volume deals rank higher)`
     );
     console.log(
       `   NET PROFIT = (median - price) minus ~${EBAY_FEE_RATE * 100}% eBay fees (shipping not included)\n`
     );
 
-    return deals;
+    return enrichedDeals;
   } catch (err) {
     console.error('Error searching active listings:', err.message);
     return [];
