@@ -5,7 +5,6 @@ import { AzureOpenAI } from 'openai';
 const SEARCH_QUERY = '"TI-84 Plus CE" graphing calculator';
 const SEARCH_EXCLUSIONS = '-charger -case -cable -cover -emulator -software -cord -bag -pouch -dock -screen -protector -"parts only" -"for parts" -stand -holder -skin -sticker -keypad';
 const CONDITION = 'Used';
-const MIN_PRICE = 25; // Floor price to exclude accessories
 const MIN_Z_SCORE = -1.0; // Show listings at or below 1 std dev under median
 const EBAY_FEE_RATE = 0.13; // ~13% eBay seller fees
 const RESULTS_PER_PAGE = 200;
@@ -139,7 +138,7 @@ async function getMarketListings(query, condition) {
   console.log(`\n📊 Fetching active market listings for "${query}" (${condition})...\n`);
 
   const conditionFilter = normalizeBrowseCondition(condition);
-  const priceFilter = MIN_PRICE > 0 ? `,price:[${MIN_PRICE}..],priceCurrency:USD` : ',priceCurrency:USD';
+  const priceFilter = ',priceCurrency:USD';
   const allItems = [];
   const pageSize = RESULTS_PER_PAGE;
   const maxItems = 10_000; // eBay Browse API pagination cap
@@ -618,14 +617,7 @@ async function findDeals(query, condition, marketStats) {
     : marketStats.median * (1 - FALLBACK_DISCOUNT_RATE);
   const maxPrice = Math.max(1, Math.floor(rawMaxPrice));
 
-  // Guard: if price floor exceeds the max price threshold, no deals are possible
-  if (MIN_PRICE > 0 && maxPrice < MIN_PRICE) {
-    console.log(
-      `\n😕 No deals possible: price floor ($${MIN_PRICE}) exceeds deal threshold (${formatCurrency(maxPrice)}).` +
-      `\n   The market spread is too tight for arbitrage at this z-score cutoff.\n`
-    );
-    return [];
-  }
+
 
   const conditionFilter = normalizeBrowseCondition(condition);
   const thresholdExplanation = hasUsableStdDev
@@ -639,8 +631,7 @@ async function findDeals(query, condition, marketStats) {
 
   try {
     const fullQuery = SEARCH_EXCLUSIONS ? `${query} ${SEARCH_EXCLUSIONS}` : query;
-    const priceFloor = MIN_PRICE > 0 ? MIN_PRICE : '';
-    const priceFilter = priceFloor ? `price:[${priceFloor}..${maxPrice}]` : `price:[..${maxPrice}]`;
+    const priceFilter = `price:[..${maxPrice}]`;
     const allDealItems = [];
     const maxItems = 10_000;
     let page = 0;
