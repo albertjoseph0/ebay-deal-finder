@@ -1,6 +1,6 @@
 # eBay Deal Finder
 
-Find underpriced eBay listings by comparing against recent sold prices.
+Find underpriced eBay listings by comparing against recent sold prices, with optional AI-powered listing evaluation.
 
 ## Setup
 
@@ -30,7 +30,33 @@ Find underpriced eBay listings by comparing against recent sold prices.
 3. Calculates **median, standard deviation, and coefficient of variation (CV)**
 4. Assesses **market quality** — is this product viable for arbitrage?
 5. Searches **active listings** priced below a z-score threshold
-6. Ranks deals by **z-score** (how many std devs below fair value)
+6. Enriches top deals with **sold quantity** data from Browse API
+7. Ranks deals by **composite score** (z-score + volume)
+8. *(Optional)* Evaluates each deal with **Azure OpenAI GPT-5.4-mini** — analyzes listing photos, description, and seller quality
+
+## LLM Evaluation (Optional)
+
+When configured, the tool uses Azure OpenAI's vision model to evaluate each deal listing, similar to how you'd manually review listings:
+
+- **Photo analysis** — checks images for screen damage, cracks, discoloration, missing parts
+- **Description analysis** — looks for red flags ("as-is", "for parts", "not tested"), functional issues
+- **Seller assessment** — grammar quality, disclosure transparency, feedback score
+- **Completeness check** — cables, charger, case, manual, accessories
+
+Each listing gets a verdict: 🟢 **BUY** | 🟡 **RISKY** | 🔴 **PASS** with confidence score and specific issues.
+
+### Azure OpenAI Setup
+
+1. Create an Azure OpenAI resource in the [Azure Portal](https://portal.azure.com)
+2. Deploy a model (e.g. `gpt-5.4-mini`) in your resource
+3. Add these to your `.env`:
+   ```
+   AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+   AZURE_OPENAI_API_KEY=your-api-key
+   AZURE_OPENAI_DEPLOYMENT=gpt-5.4-mini
+   ```
+
+If these variables are not set, LLM evaluation is skipped and the tool works normally.
 
 ## Configuration
 
@@ -42,3 +68,6 @@ Edit the constants at the top of `src/index.js`:
 | `CONDITION` | `'Used'` | Item condition filter |
 | `MIN_Z_SCORE` | `-1.0` | Show listings at or below this z-score (1σ under median) |
 | `EBAY_FEE_RATE` | `0.13` | eBay seller fee estimate (~13%) |
+| `MAX_ENRICH` | `20` | How many deals to enrich with sold quantity |
+| `MAX_LLM_EVAL` | `10` | How many deals to evaluate with LLM |
+| `MAX_IMAGES_PER_LISTING` | `5` | Max images sent to LLM per listing |

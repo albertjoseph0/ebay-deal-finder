@@ -8,6 +8,7 @@
     "search": "node --env-file=.env src/index.js"
   },
   "dependencies": {
-    "ebay-api": "^9.1.1"
+    "ebay-api": "^9.1.1",
+    "openai": "^6.33.0"
   }
 }
