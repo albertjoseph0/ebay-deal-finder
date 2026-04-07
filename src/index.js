@@ -562,7 +562,7 @@ EVALUATE THIS LISTING FOR:
       client.chat.completions.create({
         model: deployment,
         messages: [{ role: 'user', content }],
-        max_tokens: 800,
+        max_completion_tokens: 800,
         response_format: {
           type: 'json_schema',
           json_schema: {
