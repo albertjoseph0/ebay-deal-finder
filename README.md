@@ -1,6 +1,6 @@
 # eBay Deal Finder
 
-Find underpriced eBay listings by comparing against recent sold prices, with optional AI-powered listing evaluation.
+Find underpriced eBay listings by analyzing the active market price distribution, with optional AI-powered listing evaluation.
 
 ## Prerequisites
 
@@ -34,7 +34,7 @@ Find underpriced eBay listings by comparing against recent sold prices, with opt
 
 ## How It Works
 
-1. Pulls ~90 days of **sold listings** via the Finding API
+1. Pulls **active market listings** via the Browse API (up to 200 for price distribution)
 2. Removes outliers using **IQR filtering**
 3. Calculates **median, standard deviation, and coefficient of variation (CV)**
 4. Assesses **market quality** — is this product viable for arbitrage?
@@ -42,6 +42,13 @@ Find underpriced eBay listings by comparing against recent sold prices, with opt
 6. Enriches top deals with **sold quantity** data from Browse API
 7. Ranks deals by **composite score** (price score + volume)
 8. *(Optional)* Evaluates each deal with **Azure OpenAI GPT-5.4-mini** — analyzes listing photos, description, and seller quality
+
+## APIs Used
+
+- **Browse API** (`buy.browse.search`, `buy.browse.getItem`) — all listing data
+- **Azure OpenAI** (optional) — LLM-powered listing evaluation with vision
+
+> **Note:** The Finding API and Shopping API were decommissioned by eBay on Feb 4, 2025. This tool uses only the Browse API. If you have access to the Marketplace Insights API (restricted), it could enhance accuracy by providing historical sold price data.
 
 ## LLM Evaluation (Optional)
 
@@ -76,7 +83,7 @@ Edit the constants at the top of `src/index.js`:
 | `SEARCH_QUERY` | `'TI-84 Plus calculator'` | What to search for |
 | `CONDITION` | `'Used'` | Item condition filter |
 | `MIN_Z_SCORE` | `-1.0` | Z-score cutoff when market variance is usable |
-| `MIN_SOLD_SAMPLE` | `20` | Minimum sold-listing sample required for reliable pricing |
+| `MIN_MARKET_SAMPLE` | `20` | Minimum listing sample required for reliable pricing |
 | `FALLBACK_DISCOUNT_RATE` | `0.1` | Discount cutoff used when variance is too low for z-score |
 | `EBAY_FEE_RATE` | `0.13` | eBay seller fee estimate (~13%) |
 | `MAX_ENRICH` | `20` | How many deals to enrich with sold quantity |

@@ -2,15 +2,17 @@ import eBayApi from 'ebay-api';
 import { AzureOpenAI } from 'openai';
 
 // ─── Configuration ──────────────────────────────────────────────
-const SEARCH_QUERY = 'TI-84 Plus calculator';
+const SEARCH_QUERY = '"TI-84 Plus CE" graphing calculator';
+const SEARCH_EXCLUSIONS = '-charger -case -cable -cover -emulator -software -cord -bag -pouch -dock -screen -protector -"parts only" -"for parts" -stand -holder -skin -sticker -keypad';
 const CONDITION = 'Used';
+const MIN_PRICE = 25; // Floor price to exclude accessories
 const MIN_Z_SCORE = -1.0; // Show listings at or below 1 std dev under median
 const EBAY_FEE_RATE = 0.13; // ~13% eBay seller fees
 const RESULTS_PER_PAGE = 100;
-const MAX_ENRICH = 20; // How many top deals to enrich with getItem() details
-const MAX_LLM_EVAL = 10; // How many deals to evaluate with LLM
+const MAX_ENRICH = 50; // How many top deals to enrich with getItem() details
+const MAX_LLM_EVAL = 50; // How many deals to evaluate with LLM
 const MAX_IMAGES_PER_LISTING = 5; // Max images to send to LLM per listing
-const MIN_SOLD_SAMPLE = 20;
+const MIN_MARKET_SAMPLE = 20;
 const MIN_STD_DEV = 0.01;
 const FALLBACK_DISCOUNT_RATE = 0.1; // Used when market variance is too low for z-score
 const API_TIMEOUT_MS = 15_000;
@@ -132,52 +134,45 @@ function normalizeBrowseCondition(condition) {
   return condition.trim().toUpperCase().replace(/\s+/g, '_');
 }
 
-// ─── Step 1: Get sold prices (market value) ─────────────────────
-async function getSoldPrices(query, condition) {
-  console.log(`\n📊 Fetching sold listings for "${query}" (${condition})...\n`);
+// ─── Step 1: Get active market listings (price distribution) ────
+async function getMarketListings(query, condition) {
+  const fullQuery = SEARCH_EXCLUSIONS ? `${query} ${SEARCH_EXCLUSIONS}` : query;
+  console.log(`\n📊 Fetching active market listings for "${query}" (${condition})...\n`);
 
+  const conditionFilter = normalizeBrowseCondition(condition);
+  const priceFilter = MIN_PRICE > 0 ? `,price:[${MIN_PRICE}],priceCurrency:USD` : ',priceCurrency:USD';
   const allItems = [];
-  let page = 1;
-  const maxPages = 3; // up to 300 results
+  const maxPages = 2;
+  const pageSize = RESULTS_PER_PAGE;
 
-  while (page <= maxPages) {
+  for (let page = 0; page < maxPages; page++) {
     try {
       const result = await callApiWithRetry(
-        `Finding sold listings page ${page}`,
+        `Browse market listings page ${page + 1}`,
         () =>
-          eBay.finding.findItemsAdvanced({
-            keywords: query,
-            itemFilter: [
-              { name: 'SoldItemsOnly', value: 'true' },
-              { name: 'Condition', value: condition },
-            ],
-            sortOrder: 'EndTimeSoonest',
-            paginationInput: {
-              entriesPerPage: RESULTS_PER_PAGE,
-              pageNumber: page,
-            },
+          eBay.buy.browse.search({
+            q: fullQuery,
+            filter: `buyingOptions:{FIXED_PRICE},conditions:{${conditionFilter}}${priceFilter}`,
+            limit: String(pageSize),
+            offset: String(page * pageSize),
           })
       );
 
-      const items = result?.searchResult?.item;
+      const items = result?.itemSummaries;
       if (!items || items.length === 0) break;
 
       allItems.push(...items);
 
-      const totalPages = parseInt(
-        result?.paginationOutput?.totalPages || '1',
-        10
-      );
-      if (page >= totalPages) break;
-      page++;
+      const total = result?.total || 0;
+      if ((page + 1) * pageSize >= total) break;
     } catch (err) {
       if (allItems.length === 0) {
         throw new Error(
-          `Unable to fetch sold listings page ${page}: ${errorMessage(err)}`
+          `Unable to fetch market listings page ${page + 1}: ${errorMessage(err)}`
         );
       }
       console.warn(
-        `⚠ Sold listings fetch stopped at page ${page}: ${errorMessage(err)}. Continuing with ${allItems.length} result(s).`
+        `⚠ Market listings fetch stopped at page ${page + 1}: ${errorMessage(err)}. Continuing with ${allItems.length} result(s).`
       );
       break;
     }
@@ -186,24 +181,22 @@ async function getSoldPrices(query, condition) {
   return allItems;
 }
 
-// ─── Step 2: Analyze sold prices ────────────────────────────────
-function analyzePrices(soldItems) {
-  const prices = soldItems
+// ─── Step 2: Analyze market prices ──────────────────────────────
+function analyzePrices(marketItems) {
+  const prices = marketItems
     .map((item) => {
-      const priceVal =
-        item?.sellingStatus?.currentPrice?.value ??
-        item?.sellingStatus?.currentPrice;
-      return parseFloat(typeof priceVal === 'object' ? priceVal.value : priceVal);
+      const priceVal = item?.price?.value;
+      return parseFloat(priceVal);
     })
     .filter((p) => !isNaN(p) && p > 0);
 
   if (prices.length === 0) {
-    console.log('❌ No sold price data found.');
+    console.log('❌ No market price data found.');
     return null;
   }
-  if (prices.length < MIN_SOLD_SAMPLE) {
+  if (prices.length < MIN_MARKET_SAMPLE) {
     console.log(
-      `❌ Not enough sold listings for reliable pricing (${prices.length} found, need at least ${MIN_SOLD_SAMPLE}).`
+      `❌ Not enough market listings for reliable pricing (${prices.length} found, need at least ${MIN_MARKET_SAMPLE}).`
     );
     return null;
   }
@@ -212,7 +205,7 @@ function analyzePrices(soldItems) {
 
   // Raw stats (before outlier removal)
   console.log('─'.repeat(50));
-  console.log('  RAW SOLD PRICES (last ~90 days)');
+  console.log('  RAW MARKET PRICES (active listings)');
   console.log('─'.repeat(50));
   console.log(`  Items analyzed:  ${prices.length}`);
   console.log(`  Average price:   ${formatCurrency(average(prices))}`);
@@ -227,9 +220,9 @@ function analyzePrices(soldItems) {
     console.log('❌ All prices were filtered as outliers. Check your data.');
     return null;
   }
-  if (filtered.length < MIN_SOLD_SAMPLE) {
+  if (filtered.length < MIN_MARKET_SAMPLE) {
     console.log(
-      `❌ Too few listings after outlier filtering (${filtered.length} kept, need at least ${MIN_SOLD_SAMPLE}).`
+      `❌ Too few listings after outlier filtering (${filtered.length} kept, need at least ${MIN_MARKET_SAMPLE}).`
     );
     return null;
   }
@@ -348,93 +341,29 @@ function toArray(value) {
 }
 
 async function getListingDetails(itemId) {
-  let browseItem = null;
-  try {
-    browseItem = await callApiWithRetry(`Browse details for ${itemId}`, () =>
-      eBay.buy.browse.getItem(itemId)
-    );
-  } catch (err) {
-    console.warn(
-      `⚠ Browse detail lookup failed for ${itemId}: ${errorMessage(err)}`
-    );
-  }
+  const browseItem = await callApiWithRetry(`Browse details for ${itemId}`, () =>
+    eBay.buy.browse.getItem(itemId)
+  );
 
-  const browseDetails = browseItem
-    ? {
-        title: browseItem.title || '',
-        description: browseItem.description || browseItem.shortDescription || '',
-        imageUrls: [
-          browseItem?.image?.imageUrl,
-          ...toArray(browseItem?.additionalImages).map((img) => img?.imageUrl),
-        ].filter(Boolean),
-        conditionDescription: browseItem.conditionDescription || '',
-        conditionName: browseItem.condition || '',
-        itemSpecifics: toArray(browseItem?.localizedAspects).map((aspect) => ({
-          Name: aspect?.name || '',
-          Value: toArray(aspect?.value).filter(Boolean),
-        })),
-        seller: {
-          userId: browseItem?.seller?.username || '',
-          feedbackScore: browseItem?.seller?.feedbackScore || 0,
-          positiveFeedbackPercent:
-            browseItem?.seller?.feedbackPercentage || 0,
-        },
-      }
-    : null;
-
-  const legacyItemId =
-    browseItem?.legacyItemId ||
-    (itemId.includes('|') ? itemId.split('|')[1] : itemId);
-
-  if (!legacyItemId) {
-    if (browseDetails) return browseDetails;
-    throw new Error(`Unable to resolve a legacy item ID for ${itemId}`);
-  }
-
-  try {
-    const result = await callApiWithRetry(
-      `Shopping details for ${legacyItemId}`,
-      () =>
-        eBay.shopping.GetSingleItem({
-          ItemID: legacyItemId,
-          IncludeSelector: 'Details,Description,ItemSpecifics',
-        })
-    );
-
-    const item = result?.Item || result;
-    const shoppingImages = toArray(item?.PictureURL).filter(Boolean);
-
-    return {
-      title: item?.Title || browseDetails?.title || '',
-      description: item?.Description || browseDetails?.description || '',
-      imageUrls:
-        shoppingImages.length > 0
-          ? shoppingImages
-          : browseDetails?.imageUrls || [],
-      conditionDescription:
-        item?.ConditionDescription || browseDetails?.conditionDescription || '',
-      conditionName: item?.ConditionDisplayName || browseDetails?.conditionName || '',
-      itemSpecifics:
-        item?.ItemSpecifics?.NameValueList || browseDetails?.itemSpecifics || [],
-      seller: {
-        userId: item?.Seller?.UserID || browseDetails?.seller?.userId || '',
-        feedbackScore:
-          item?.Seller?.FeedbackScore ?? browseDetails?.seller?.feedbackScore ?? 0,
-        positiveFeedbackPercent:
-          item?.Seller?.PositiveFeedbackPercent ??
-          browseDetails?.seller?.positiveFeedbackPercent ??
-          0,
-      },
-    };
-  } catch (err) {
-    console.warn(
-      `⚠ Shopping detail lookup failed for ${legacyItemId}: ${errorMessage(err)}`
-    );
-    if (browseDetails) return browseDetails;
-    throw new Error(
-      `Unable to load listing details for ${itemId}: ${errorMessage(err)}`
-    );
-  }
+  return {
+    title: browseItem.title || '',
+    description: browseItem.description || browseItem.shortDescription || '',
+    imageUrls: [
+      browseItem?.image?.imageUrl,
+      ...toArray(browseItem?.additionalImages).map((img) => img?.imageUrl),
+    ].filter(Boolean),
+    conditionDescription: browseItem.conditionDescription || '',
+    conditionName: browseItem.condition || '',
+    itemSpecifics: toArray(browseItem?.localizedAspects).map((aspect) => ({
+      Name: aspect?.name || '',
+      Value: toArray(aspect?.value).filter(Boolean),
+    })),
+    seller: {
+      userId: browseItem?.seller?.username || '',
+      feedbackScore: browseItem?.seller?.feedbackScore || 0,
+      positiveFeedbackPercent: browseItem?.seller?.feedbackPercentage || 0,
+    },
+  };
 }
 
 // ─── Step 3c: Evaluate a single listing with Azure OpenAI ───────
@@ -513,7 +442,9 @@ async function evaluateListingWithLLM(listingDetails, dealContext) {
   const content = [
     {
       type: 'text',
-      text: `You are an expert eBay arbitrage analyst evaluating a listing for resale potential.
+      text: `You are an expert eBay arbitrage analyst specializing in evaluating "${SEARCH_QUERY}" listings for resale potential.
+
+Your job is to determine whether this listing is actually a "${SEARCH_QUERY}" (not an accessory, case, cable, cover, or unrelated item), and if so, whether it's a good buy for resale.
 
 LISTING DETAILS:
 - Title: ${listingDetails.title}
@@ -534,11 +465,12 @@ DEAL CONTEXT:
 - Estimated net profit: $${dealContext.netProfit.toFixed(2)}
 
 EVALUATE THIS LISTING FOR:
-1. PHOTO ANALYSIS: Check all images for physical damage, screen issues, cracks, discoloration, missing parts, or anything that looks wrong
-2. DESCRIPTION ANALYSIS: Look for red-flag phrases ("as-is", "for parts", "not tested", "no returns"), functional issues mentioned, missing accessories
-3. SELLER ASSESSMENT: Grammar quality, disclosure transparency, feedback score, signs of competence or potential scam
-4. COMPLETENESS: Are cables, charger, case, manual, or other accessories included?
-5. OVERALL VERDICT: Given the price vs. market value, is this a good buy for resale?`,
+1. PRODUCT VERIFICATION: Is this actually a "${SEARCH_QUERY}"? If it's an accessory, case, cable, cover, replacement part, or different product entirely, verdict should be PASS regardless of price.
+2. PHOTO ANALYSIS: Check all images for physical damage, screen issues, cracks, discoloration, missing parts, or anything that looks wrong for this specific product.
+3. DESCRIPTION ANALYSIS: Look for red-flag phrases ("as-is", "for parts", "not tested", "no returns"), functional issues mentioned, missing accessories.
+4. SELLER ASSESSMENT: Grammar quality, disclosure transparency, feedback score, signs of competence or potential scam.
+5. COMPLETENESS: Are expected accessories included (e.g., charger, USB cable, slide cover, batteries)?
+6. OVERALL VERDICT: Given the price vs. market value, is this a good buy for resale as a "${SEARCH_QUERY}"?`,
     },
   ];
 
@@ -607,6 +539,8 @@ EVALUATE THIS LISTING FOR:
 }
 
 // ─── Step 3d: Evaluate all deals with LLM ───────────────────────
+const LLM_CONCURRENCY = 5;
+
 async function evaluateDealsWithLLM(deals, marketStats) {
   // Check if Azure OpenAI is configured
   if (
@@ -622,16 +556,14 @@ async function evaluateDealsWithLLM(deals, marketStats) {
 
   const toEvaluate = deals.slice(0, MAX_LLM_EVAL);
   console.log(
-    `\n🤖 Evaluating top ${toEvaluate.length} deals with Azure OpenAI (GPT-5.4-mini)...\n`
+    `\n🤖 Evaluating top ${toEvaluate.length} deals with Azure OpenAI (${LLM_CONCURRENCY} parallel)...\n`
   );
 
-  for (let i = 0; i < toEvaluate.length; i++) {
-    const deal = toEvaluate[i];
-    const label = `  [${i + 1}/${toEvaluate.length}] ${deal.title.substring(0, 40)}...`;
+  let completed = 0;
 
+  async function evaluateOne(deal, index) {
+    const label = `  [${index + 1}/${toEvaluate.length}] ${deal.title.substring(0, 40)}...`;
     try {
-      process.stdout.write(`${label} `);
-
       const details = await getListingDetails(deal.itemId);
       const evaluation = await evaluateListingWithLLM(details, {
         price: deal.price,
@@ -649,14 +581,22 @@ async function evaluateDealsWithLLM(deals, marketStats) {
       const verdictIcon =
         evaluation.verdict === 'BUY' ? '🟢' :
         evaluation.verdict === 'RISKY' ? '🟡' : '🔴';
-      console.log(`${verdictIcon} ${evaluation.verdict} (${evaluation.confidence}%)`);
+      completed++;
+      console.log(`${label} ${verdictIcon} ${evaluation.verdict} (${evaluation.confidence}%) [${completed}/${toEvaluate.length}]`);
     } catch (err) {
       deal.llmVerdict = 'N/A';
       deal.llmConfidence = 0;
       deal.llmIssues = [];
       deal.llmSummary = `Error: ${errorMessage(err)}`;
-      console.log(`⚪ Error: ${errorMessage(err).substring(0, 60)}`);
+      completed++;
+      console.log(`${label} ⚪ Error: ${errorMessage(err).substring(0, 60)} [${completed}/${toEvaluate.length}]`);
     }
+  }
+
+  // Process in batches of LLM_CONCURRENCY
+  for (let i = 0; i < toEvaluate.length; i += LLM_CONCURRENCY) {
+    const batch = toEvaluate.slice(i, i + LLM_CONCURRENCY);
+    await Promise.all(batch.map((deal, j) => evaluateOne(deal, i + j)));
   }
 
   return deals;
@@ -680,10 +620,13 @@ async function findDeals(query, condition, marketStats) {
   );
 
   try {
+    const fullQuery = SEARCH_EXCLUSIONS ? `${query} ${SEARCH_EXCLUSIONS}` : query;
+    const priceFloor = MIN_PRICE > 0 ? MIN_PRICE : '';
+    const priceFilter = priceFloor ? `price:[${priceFloor}..${maxPrice}]` : `price:[..${maxPrice}]`;
     const results = await callApiWithRetry(`Browse search for "${query}"`, () =>
       eBay.buy.browse.search({
-        q: query,
-        filter: `buyingOptions:{FIXED_PRICE},conditions:{${conditionFilter}},price:[..${maxPrice}],priceCurrency:USD`,
+        q: fullQuery,
+        filter: `buyingOptions:{FIXED_PRICE},conditions:{${conditionFilter}},${priceFilter},priceCurrency:USD`,
         sort: 'price',
         limit: '50',
       })
@@ -860,18 +803,19 @@ async function main() {
   console.log(`  Query:     "${SEARCH_QUERY}"`);
   console.log(`  Condition: ${CONDITION}`);
   console.log(`  Min z:     ${MIN_Z_SCORE} (${Math.abs(MIN_Z_SCORE)}σ below median)`);
+  console.log(`  Strategy:  Active market price distribution`);
   console.log('═'.repeat(50));
 
-  // Step 1: Get sold data
-  const soldItems = await getSoldPrices(SEARCH_QUERY, CONDITION);
+  // Step 1: Get active market listings for price distribution
+  const marketItems = await getMarketListings(SEARCH_QUERY, CONDITION);
 
-  if (soldItems.length === 0) {
-    console.log('❌ No sold items found. Check your query or API credentials.');
+  if (marketItems.length === 0) {
+    console.log('❌ No market listings found. Check your query or API credentials.');
     process.exit(1);
   }
 
   // Step 2: Analyze market prices
-  const stats = analyzePrices(soldItems);
+  const stats = analyzePrices(marketItems);
   if (!stats) process.exit(1);
 
   // Step 3: Find deals
