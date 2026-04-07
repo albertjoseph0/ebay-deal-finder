@@ -1,91 +1,70 @@
-# eBay Deal Finder
+# eBay Deal Finder (Python Notebook)
 
-Find underpriced eBay listings by analyzing the active market price distribution, with optional AI-powered listing evaluation.
+Find underpriced eBay listings by analyzing active market price distribution, then optionally evaluating listings with Azure OpenAI vision.
 
 ## Prerequisites
 
-- **Node.js 20.6+** (required for `node --env-file`)
+- Python 3.10+
+- Jupyter Notebook or JupyterLab
 
 ## Setup
 
-1. **Get eBay API keys** at [developer.ebay.com](https://developer.ebay.com)
-   - Create an account → Application Keys → Create a Production keyset
-
-2. **Configure credentials**
+1. Copy environment template:
    ```bash
    cp .env.example .env
-   # Edit .env with your API keys
    ```
 
-3. **Install dependencies**
+2. Fill in `.env` with your eBay keys:
+   - `EBAY_APP_ID`
+   - `EBAY_CERT_ID`
+   - Optional Azure OpenAI values for LLM evaluation:
+     - `AZURE_OPENAI_ENDPOINT`
+     - `AZURE_OPENAI_API_KEY`
+     - `AZURE_OPENAI_DEPLOYMENT`
+
+3. Install dependencies:
    ```bash
-   npm install
+   python3 -m pip install requests python-dotenv openai notebook
    ```
 
-4. **Lint**
+4. Launch the notebook:
    ```bash
-   npm run lint
+   jupyter notebook ebay_deal_finder.ipynb
    ```
 
-5. **Run it**
-   ```bash
-   npm start
-   ```
+## Notebook Workflow
 
-## How It Works
+Run cells top-to-bottom:
 
-1. Pulls **active market listings** via the Browse API (up to 200 for price distribution)
-2. Removes outliers using **IQR filtering**
-3. Calculates **median, standard deviation, and coefficient of variation (CV)**
-4. Assesses **market quality** — is this product viable for arbitrage?
-5. Searches **active fixed-price listings** below a z-score threshold *(or discount fallback when variance is too low)*
-6. Enriches top deals with **sold quantity** data from Browse API
-7. Ranks deals by **composite score** (price score + volume)
-8. *(Optional)* Evaluates each deal with **Azure OpenAI GPT-5.4-mini** — analyzes listing photos, description, and seller quality
+1. Imports + configuration
+2. Shared helpers (stats, retries, ranking)
+3. eBay API + shared item cache
+4. Market sampling and analysis
+5. Deal discovery and sold-quantity enrichment
+6. Optional LLM evaluation
+7. Final ranking and display
+8. End-to-end pipeline execution
+9. Deterministic sanity checks (no network)
 
-## APIs Used
+## Key Configuration Variables
 
-- **Browse API** (`buy.browse.search`, `buy.browse.getItem`) — all listing data
-- **Azure OpenAI** (optional) — LLM-powered listing evaluation with vision
-
-> **Note:** The Finding API and Shopping API were decommissioned by eBay on Feb 4, 2025. This tool uses only the Browse API. If you have access to the Marketplace Insights API (restricted), it could enhance accuracy by providing historical sold price data.
-
-## LLM Evaluation (Optional)
-
-When configured, the tool uses Azure OpenAI's vision model to evaluate each deal listing, similar to how you'd manually review listings:
-
-- **Photo analysis** — checks images for screen damage, cracks, discoloration, missing parts
-- **Description analysis** — looks for red flags ("as-is", "for parts", "not tested"), functional issues
-- **Seller assessment** — grammar quality, disclosure transparency, feedback score
-- **Completeness check** — cables, charger, case, manual, accessories
-
-Each listing gets a verdict: 🟢 **BUY** | 🟡 **RISKY** | 🔴 **PASS** with confidence score and specific issues.
-
-### Azure OpenAI Setup
-
-1. Create an Azure OpenAI resource in the [Azure Portal](https://portal.azure.com)
-2. Deploy a model (e.g. `gpt-5.4-mini`) in your resource
-3. Add these to your `.env`:
-   ```
-   AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
-   AZURE_OPENAI_API_KEY=your-api-key
-   AZURE_OPENAI_DEPLOYMENT=gpt-5.4-mini
-   ```
-
-If these variables are not set, LLM evaluation is skipped and the tool works normally.
-
-## Configuration
-
-Edit the constants at the top of `src/index.js`:
+These are defined in the notebook config cell.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `SEARCH_QUERY` | `'TI-84 Plus calculator'` | What to search for |
-| `CONDITION` | `'Used'` | Item condition filter |
-| `MIN_Z_SCORE` | `-1.0` | Z-score cutoff when market variance is usable |
-| `MIN_MARKET_SAMPLE` | `20` | Minimum listing sample required for reliable pricing |
-| `FALLBACK_DISCOUNT_RATE` | `0.1` | Discount cutoff used when variance is too low for z-score |
-| `EBAY_FEE_RATE` | `0.13` | eBay seller fee estimate (~13%) |
-| `MAX_ENRICH` | `20` | How many deals to enrich with sold quantity |
-| `MAX_LLM_EVAL` | `10` | How many deals to evaluate with LLM |
-| `MAX_IMAGES_PER_LISTING` | `5` | Max images sent to LLM per listing |
+|---|---:|---|
+| `SEARCH_QUERY` | `"TI-84 Plus CE" graphing calculator` | Search phrase |
+| `CONDITION` | `Used` | eBay condition filter |
+| `MIN_Z_SCORE` | `-1.0` | Statistical deal threshold when variance is usable |
+| `MIN_MARKET_SAMPLE` | `20` | Minimum listing sample required |
+| `FALLBACK_DISCOUNT_RATE` | `0.10` | Discount threshold used when std dev is too small |
+| `EBAY_FEE_RATE` | `0.13` | Estimated seller fee rate |
+| `MAX_LLM_CALLS` | `200` | Maximum deals sent to LLM evaluation |
+| `MAX_IMAGES_PER_LISTING` | `5` | Images per listing for LLM |
+| `API_TIMEOUT_S` | `15` | HTTP timeout for eBay calls |
+| `LLM_TIMEOUT_S` | `45` | Timeout for Azure OpenAI calls |
+
+## Notes
+
+- The notebook intentionally does **not** cap sold-quantity enrichment breadth.
+- LLM evaluation is optional; without Azure config, recommendations fall back to price-signal logic.
+- The shared `getItem` cache avoids duplicate listing-detail requests across enrichment and LLM analysis.
