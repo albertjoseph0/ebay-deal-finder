@@ -62,9 +62,13 @@ These are defined in the notebook config cell.
 | `MAX_IMAGES_PER_LISTING` | `5` | Images per listing for LLM |
 | `API_TIMEOUT_S` | `15` | HTTP timeout for eBay calls |
 | `LLM_TIMEOUT_S` | `45` | Timeout for Azure OpenAI calls |
+| `BUYER_COUNTRY` | `US` | Buyer's country code (improves shipping estimates) |
+| `BUYER_POSTAL_CODE` | *(empty)* | Buyer's postal/ZIP code (enables accurate CALCULATED shipping) |
 
 ## Notes
 
+- **Shipping-aware pricing**: All statistics (median, mean, IQR), deal scoring (z-score, discount %), and profit calculations use **total cost** (item price + shipping). The SHIP and TOTAL columns in the results table show the breakdown.
+- Setting `BUYER_POSTAL_CODE` sends the `X-EBAY-C-ENDUSERCTX` header to eBay, which returns accurate shipping estimates for CALCULATED-shipping listings. Without it, some shipping costs may show as `?`.
 - The notebook intentionally does **not** cap sold-quantity enrichment breadth.
 - LLM evaluation is optional; without Azure config, recommendations fall back to price-signal logic.
 - The shared `getItem` cache avoids duplicate listing-detail requests across enrichment and LLM analysis.
