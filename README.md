@@ -53,7 +53,9 @@ These are defined in the notebook config cell.
 | Variable | Default | Description |
 |---|---:|---|
 | `SEARCH_QUERY` | `"TI-84 Plus CE" graphing calculator` | Search phrase |
+| `SEARCH_EXCLUSIONS` | *(see config cell)* | Terms to exclude from search |
 | `CONDITION` | `Used` | eBay condition filter |
+| `LLM_PRODUCT_GUIDANCE` | *(see config cell)* | Optional product-specific LLM evaluation tips |
 | `MIN_Z_SCORE` | `-1.0` | Statistical deal threshold when variance is usable |
 | `MIN_MARKET_SAMPLE` | `20` | Minimum listing sample required |
 | `FALLBACK_DISCOUNT_RATE` | `0.10` | Discount threshold used when std dev is too small |
@@ -64,6 +66,41 @@ These are defined in the notebook config cell.
 | `LLM_TIMEOUT_S` | `45` | Timeout for Azure OpenAI calls |
 | `BUYER_COUNTRY` | `US` | Buyer's country code (improves shipping estimates) |
 | `BUYER_POSTAL_CODE` | *(empty)* | Buyer's postal/ZIP code (enables accurate CALCULATED shipping) |
+
+## Searching for Different Products
+
+The notebook is designed to work with **any product**. To switch products, update the
+`PRODUCT CONFIGURATION` section at the top of the config cell (cell 2):
+
+### Example: TI-84 Plus CE Graphing Calculator
+```python
+SEARCH_QUERY = '"TI-84 Plus CE" graphing calculator'
+SEARCH_EXCLUSIONS = '-charger -case -cable -cover -"parts only" -"for parts" -stand -holder -skin'
+CONDITION = "Used"
+LLM_PRODUCT_GUIDANCE = "Check that the screen powers on with no dead pixels. Color screen CE models are the target."
+```
+
+### Example: AirPods Pro (2nd Generation)
+```python
+SEARCH_QUERY = '"AirPods Pro" 2nd generation'
+SEARCH_EXCLUSIONS = '-case -tips -ear -cushion -"left only" -"right only" -"parts only" -"for parts" -skin'
+CONDITION = "Used"
+LLM_PRODUCT_GUIDANCE = "Verify both earbuds and charging case are included. Check battery health if mentioned. Ensure genuine Apple, not knockoffs."
+```
+
+### Example: Dyson V15 Detect Vacuum
+```python
+SEARCH_QUERY = '"Dyson V15" detect vacuum'
+SEARCH_EXCLUSIONS = '-filter -brush -head -hose -"parts only" -"for parts" -attachment -wand -bin'
+CONDITION = "Used"
+LLM_PRODUCT_GUIDANCE = "Confirm all attachments are included. Check suction power claims. Verify battery holds charge."
+```
+
+### Tips
+- **`SEARCH_QUERY`**: Use eBay-style quotes for exact phrases. Test your query on ebay.com first.
+- **`SEARCH_EXCLUSIONS`**: Prefix each unwanted term with `-`. Focus on accessories and parts that share keywords with the main product.
+- **`CONDITION`**: Don't mix conditions (e.g., "New" + "Used") — it skews the statistical analysis.
+- **`LLM_PRODUCT_GUIDANCE`**: Optional. Tell the LLM what to look for when evaluating this specific product. Leave empty (`""`) to use default evaluation only.
 
 ## Notes
 
